@@ -1,0 +1,14 @@
+# Secrets & Local Environment
+.env
+authorized_sessions.json
+GEMINI.md
+
+# WAHA Runtime Data & Media
+sessions/
+media/
+Microsoft/
+
+# Python Cache & Logs
+__pycache__/
+*.pyc
+*.log
