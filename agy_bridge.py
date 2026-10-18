@@ -234,21 +234,18 @@ def send_whatsapp_message(chat_id, text):
     except Exception as e:
         print(f"[Bridge] Exception sending message: {e}", flush=True)
 
-def send_typing_indicator(chat_id):
+def send_presence_online(http_session=None):
     headers = {
         "Content-Type": "application/json",
         "X-Api-Key": WAHA_API_KEY
     }
-    payload = {
-        "chatId": chat_id,
-        "session": "default"
-    }
+    req = http_session or requests
     try:
-        requests.post(f"{WAHA_URL}/api/startTyping", json=payload, headers=headers, timeout=4)
+        req.post(f"{WAHA_URL}/api/default/presence", json={"presence": "online"}, headers=headers, timeout=4)
     except Exception:
         pass
 
-def stop_typing_indicator(chat_id):
+def send_seen(chat_id, http_session=None):
     headers = {
         "Content-Type": "application/json",
         "X-Api-Key": WAHA_API_KEY
@@ -257,38 +254,94 @@ def stop_typing_indicator(chat_id):
         "chatId": chat_id,
         "session": "default"
     }
+    req = http_session or requests
     try:
-        requests.post(f"{WAHA_URL}/api/stopTyping", json=payload, headers=headers, timeout=4)
+        req.post(f"{WAHA_URL}/api/sendSeen", json=payload, headers=headers, timeout=4)
+    except Exception:
+        pass
+
+def send_typing_indicator(chat_id, http_session=None):
+    headers = {
+        "Content-Type": "application/json",
+        "X-Api-Key": WAHA_API_KEY
+    }
+    payload = {
+        "chatId": chat_id,
+        "session": "default"
+    }
+    req = http_session or requests
+    try:
+        req.post(f"{WAHA_URL}/api/startTyping", json=payload, headers=headers, timeout=4)
+    except Exception:
+        pass
+
+def stop_typing_indicator(chat_id, http_session=None):
+    headers = {
+        "Content-Type": "application/json",
+        "X-Api-Key": WAHA_API_KEY
+    }
+    payload = {
+        "chatId": chat_id,
+        "session": "default"
+    }
+    req = http_session or requests
+    try:
+        req.post(f"{WAHA_URL}/api/stopTyping", json=payload, headers=headers, timeout=4)
     except Exception:
         pass
 
 class ContinuousTyping:
-    """Continuously refreshes WhatsApp typing indicator every 2.5s while AGY is processing."""
+    """
+    Continuously refreshes WhatsApp typing indicator while AGY is processing.
+    WhatsApp Web (WAWebChatStateBridge) throttles consecutive `sendChatStateComposing`
+    calls for 25s while mobile clients hide the indicator after ~10s.
+    By briefly pulsing `stopTyping` -> `startTyping` every 4s and maintaining `online`
+    presence, WhatsApp Web is forced to transmit a fresh `<composing/>` packet every cycle.
+    """
     def __init__(self, chat_id):
         self.chat_id = chat_id
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
+    def _get_target_ids(self):
+        targets = [self.chat_id]
+        if self.chat_id in MY_ACCOUNTS:
+            for alt_id in list(MY_ACCOUNTS):
+                if alt_id != self.chat_id:
+                    targets.append(alt_id)
+        return targets
+
     def _run(self):
-        while not self.stop_event.is_set():
-            send_typing_indicator(self.chat_id)
-            if self.chat_id in MY_ACCOUNTS:
-                for alt_id in list(MY_ACCOUNTS):
-                    if alt_id != self.chat_id:
-                        send_typing_indicator(alt_id)
-            # Sleep 2.5 seconds before pinging typing again
-            self.stop_event.wait(2.5)
+        with requests.Session() as sess:
+            targets = self._get_target_ids()
+            send_presence_online(sess)
+            for cid in targets:
+                send_seen(cid, sess)
+
+            tick = 0
+            while not self.stop_event.is_set():
+                targets = self._get_target_ids()
+                if tick > 0:
+                    # Pulse paused -> composing so WhatsApp Web bypasses its 25s internal throttle
+                    send_presence_online(sess)
+                    for cid in targets:
+                        stop_typing_indicator(cid, sess)
+                    if self.stop_event.wait(0.15):
+                        break
+                for cid in targets:
+                    send_typing_indicator(cid, sess)
+                tick += 1
+                # Wait 4 seconds before the next state-refresh pulse
+                self.stop_event.wait(4.0)
 
     def start(self):
         self.thread.start()
 
     def stop(self):
         self.stop_event.set()
-        stop_typing_indicator(self.chat_id)
-        if self.chat_id in MY_ACCOUNTS:
-            for alt_id in list(MY_ACCOUNTS):
-                if alt_id != self.chat_id:
-                    stop_typing_indicator(alt_id)
+        with requests.Session() as sess:
+            for cid in self._get_target_ids():
+                stop_typing_indicator(cid, sess)
 
 def download_media_file(media_dict):
     """Downloads media from WAHA into C:\\waha\\media\\downloads."""
