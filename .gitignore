@@ -17,3 +17,9 @@ __pycache__/
 .restart_notify
 *.ps1
 
+# Generated Documents, Screenshots & Scratch
+*.png
+*.pdf
+*.docx
+pip/
+
