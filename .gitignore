@@ -12,3 +12,8 @@ Microsoft/
 __pycache__/
 *.pyc
 *.log
+
+# Runtime restart markers & workers
+.restart_notify
+*.ps1
+

@@ -565,10 +565,84 @@ def format_model_list(current_model, force_refresh=False):
     ])
     return "\n".join(lines)
 
+def handle_tunnel_restart(target_chat):
+    """
+    Handles remote hard restart of the AGY bridge tunnel.
+    Can be invoked via '///restart' from WhatsApp to recover if AGY hangs.
+    """
+    print(f"[Bridge] Remote hard restart requested by {target_chat}!", flush=True)
+    send_whatsapp_message(
+        target_chat,
+        "🔄 *Restarting AGY Tunnel...*\n\n"
+        "• Terminating active AGY tasks & child processes\n"
+        "• Clearing locks and resetting bridge state\n"
+        "• Rebooting bridge service in 3 seconds..."
+    )
+
+    # Save marker file so the new instance notifies the chat upon startup
+    try:
+        marker_file = os.path.join(BASE_DIR, ".restart_notify")
+        with open(marker_file, "w", encoding="utf-8") as f:
+            json.dump({"chat_id": target_chat, "timestamp": time.time()}, f)
+    except Exception as e:
+        print(f"[Bridge] Warning writing restart marker: {e}", flush=True)
+
+    # Kill any active agy.exe processes immediately to unhang CLI
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "agy.exe", "/T"],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=5
+        )
+    except Exception:
+        pass
+
+    # Launch detached restart worker via WMI so it outlives this process
+    restart_script = os.path.join(BASE_DIR, "restart_tunnel_worker.ps1")
+    ps_content = (
+        "Start-Sleep -Seconds 3\n"
+        "$pids = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*agy_bridge.py*' -and $_.ProcessId -ne $PID } | Select-Object -ExpandProperty ProcessId\n"
+        "foreach ($p in $pids) {\n"
+        "    try { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } catch {}\n"
+        "}\n"
+        "Start-Sleep -Seconds 1\n"
+        "Start-Process -FilePath 'C:\\Program Files\\Python311\\python.exe' -ArgumentList '-u C:\\waha\\agy_bridge.py' -WorkingDirectory 'C:\\waha' -WindowStyle Hidden -RedirectStandardOutput 'C:\\waha\\bridge_stdout.log' -RedirectStandardError 'C:\\waha\\bridge_stderr.log'\n"
+    )
+    try:
+        with open(restart_script, "w", encoding="utf-8") as f:
+            f.write(ps_content)
+
+        wmi_cmd = f'powershell.exe -ExecutionPolicy Bypass -NoProfile -File "{restart_script}"'
+        subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-Command",
+                f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{wmi_cmd}'}}"
+            ],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=10
+        )
+    except Exception as e:
+        print(f"[Bridge] Exception triggering WMI restart: {e}", flush=True)
+
 def process_message(target_chat, body, sender_name, media_dict=None):
     session_key = canonical_chat_id(target_chat)
     now = time.time()
     body_clean = body.strip()
+
+    # Step 0: Remote Hard Restart Command ("///restart")
+    # Allows recovering the tunnel remotely even if a task hangs or session expires
+    if body_clean.lower() == "///restart" or body_clean.lower().startswith("///restart "):
+        passphrase_arg = body_clean.split(maxsplit=1)[1].strip() if " " in body_clean else ""
+        is_self = (session_key == "self")
+        with lock:
+            last_active = active_sessions.get(session_key)
+            is_authed = (last_active is not None and (now - last_active <= INACTIVITY_TIMEOUT_SECONDS))
+
+        if is_self or is_authed or passphrase_arg == PASSPHRASE:
+            handle_tunnel_restart(target_chat)
+            return
 
     # Step 1: Authentication & Inactivity Check
     with lock:
@@ -632,6 +706,7 @@ def process_message(target_chat, body, sender_name, media_dict=None):
                 "• `/clear` - Reset context and start a clean session\n"
                 "• `/status` - Check timeout countdown & active model\n"
                 "• `/lock` - Manually lock the session\n"
+                "• `///restart` - Hard reset & reboot bridge tunnel if unresponsive\n"
                 "• `/help` - Show this commands list\n\n"
                 "📎 *Documents & Images:*\n"
                 "Attach any PDF, code, document, or image with your prompt to have AGY analyze it directly!"
@@ -920,6 +995,34 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # Mute standard HTTP request access logging
         pass
 
+def check_and_notify_restart():
+    restart_marker = os.path.join(BASE_DIR, ".restart_notify")
+    if os.path.exists(restart_marker):
+        try:
+            with open(restart_marker, "r", encoding="utf-8") as rf:
+                rdata = json.load(rf)
+            notify_chat = rdata.get("chat_id")
+            if notify_chat:
+                time.sleep(2)
+                with lock:
+                    active_mod = user_models.get(canonical_chat_id(notify_chat), DEFAULT_MODEL)
+                msg = (
+                    "🟢 *AGY Tunnel Restarted Successfully*\n\n"
+                    "Bridge is online, locks cleared, and service is operational.\n"
+                    f"• *Active Model:* `{active_mod}`\n"
+                    "• *Timeout Watchdog:* 10 minutes\n\n"
+                    "Send any prompt or command to continue."
+                )
+                send_whatsapp_message(notify_chat, msg)
+        except Exception as e:
+            print(f"[Bridge] Error handling restart notify: {e}", flush=True)
+        finally:
+            try:
+                if os.path.exists(restart_marker):
+                    os.remove(restart_marker)
+            except Exception:
+                pass
+
 def main():
     sync_gemini_md()
     refresh_my_accounts()
@@ -928,6 +1031,8 @@ def main():
 
     watchdog_thread = threading.Thread(target=session_inactivity_watchdog, daemon=True)
     watchdog_thread.start()
+
+    threading.Thread(target=check_and_notify_restart, daemon=True).start()
 
     server_address = ("", PORT)
     httpd = BridgeHTTPServer(server_address, WebhookHandler)
