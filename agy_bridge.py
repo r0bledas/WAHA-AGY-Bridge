@@ -91,6 +91,41 @@ cached_models = []                    # [(model_id, label), ...]
 last_models_fetch = 0
 lock = threading.RLock()              # Reentrant lock to prevent self-deadlock on nested calls
 
+# Active Turn tracking for instant preemption and interruption
+class ActiveTurn:
+    def __init__(self, session_key, target_chat, prompt_text):
+        self.session_key = session_key
+        self.target_chat = target_chat
+        self.prompt_text = prompt_text
+        self.proc = None
+        self.typing_indicator = None
+        self.is_interrupted = threading.Event()
+        self.is_completed = threading.Event()
+        self.lock = threading.Lock()
+
+    def interrupt(self, reason="Interrupted by new prompt"):
+        with self.lock:
+            if self.is_completed.is_set():
+                return
+            self.is_interrupted.set()
+            if self.typing_indicator:
+                try:
+                    self.typing_indicator.stop()
+                except Exception:
+                    pass
+            if self.proc and self.proc.pid:
+                kill_process_tree(self.proc.pid)
+
+active_turns = {}  # {session_key: ActiveTurn}
+
+def interrupt_active_turn(session_key, reason="Interrupted by user"):
+    with lock:
+        turn = active_turns.get(session_key)
+        if turn and not turn.is_completed.is_set():
+            turn.interrupt(reason=reason)
+            return turn
+    return None
+
 def kill_process_tree(pid):
     """Forcefully kills a process and all its child processes on Windows."""
     if not pid:
@@ -217,7 +252,36 @@ def save_sessions():
         print(f"[Bridge] Warning saving sessions: {e}", flush=True)
 
 
-def send_whatsapp_message(chat_id, text):
+def chunk_message(text, max_chars=3500):
+    """Splits long messages at paragraph or sentence breaks without altering markdown."""
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    remaining = text
+    while len(remaining) > max_chars:
+        split_idx = remaining.rfind("\n\n", 0, max_chars)
+        if split_idx == -1 or split_idx < max_chars // 3:
+            split_idx = remaining.rfind("\n", 0, max_chars)
+        if split_idx == -1 or split_idx < max_chars // 3:
+            split_idx = remaining.rfind(". ", 0, max_chars)
+            if split_idx != -1:
+                split_idx += 1
+        if split_idx == -1 or split_idx < max_chars // 3:
+            split_idx = max_chars
+
+        chunk = remaining[:split_idx].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_idx:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+def _send_whatsapp_single_message(chat_id, text):
     stripped = text.strip()
     if stripped:
         with lock:
@@ -251,6 +315,13 @@ def send_whatsapp_message(chat_id, text):
             print(f"[Bridge] Error sending message to {chat_id}: {r.status_code} {r.text}", flush=True)
     except Exception as e:
         print(f"[Bridge] Exception sending message: {e}", flush=True)
+
+def send_whatsapp_message(chat_id, text):
+    chunks = chunk_message(text, max_chars=3500)
+    for i, chunk in enumerate(chunks):
+        _send_whatsapp_single_message(chat_id, chunk)
+        if i < len(chunks) - 1:
+            time.sleep(0.35)
 
 def session_inactivity_watchdog():
     """
@@ -456,7 +527,7 @@ def sync_gemini_md():
     except Exception as e:
         print(f"[Bridge] Warning syncing GEMINI.md: {e}", flush=True)
 
-def run_agy_prompt(prompt, model=None, continue_session=False):
+def run_agy_prompt(prompt, model=None, continue_session=False, turn=None):
     """Executes agy.exe directly using file-backed stdout/stderr to avoid Windows pipe inheritance hangs."""
     proc = None
     try:
@@ -485,6 +556,8 @@ def run_agy_prompt(prompt, model=None, continue_session=False):
                 env=get_agy_env(),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
+            if turn:
+                turn.proc = proc
             try:
                 proc.wait(timeout=AGY_MAX_PROMPT_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
@@ -494,6 +567,9 @@ def run_agy_prompt(prompt, model=None, continue_session=False):
 
             # Ensure any lingering grandchild processes are cleaned up
             kill_process_tree(proc.pid)
+
+            if turn and turn.is_interrupted.is_set():
+                return "⚠️ Interrupted by new prompt"
 
             out_f.seek(0)
             err_f.seek(0)
@@ -524,7 +600,7 @@ def run_agy_prompt(prompt, model=None, continue_session=False):
             kill_process_tree(proc.pid)
         return f"⚠️ Failed to execute AGY: {str(e)}"
 
-def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False):
+def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, turn=None):
     """
     Executes agy.exe with --output-format stream-json, progressively
     parsing NDJSON events and dispatching separated responses to WhatsApp.
@@ -559,6 +635,8 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False):
             env=get_agy_env(),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
+        if turn:
+            turn.proc = proc
     except Exception as e:
         print(f"[Bridge-Stream] Failed to spawn AGY process: {e}", flush=True)
         return f"⚠️ Failed to spawn AGY: {e}"
@@ -608,6 +686,11 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False):
     has_sent_intermediate = False
 
     while True:
+        if turn and turn.is_interrupted.is_set():
+            print(f"[Bridge-Stream] Turn interrupted. Aborting stream...", flush=True)
+            kill_process_tree(proc.pid)
+            return "⚠️ Interrupted by new prompt"
+
         now = time.time()
 
         # Check Watchdogs
@@ -629,6 +712,10 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False):
             if proc.poll() is not None and line_queue.empty():
                 break
             continue
+
+        if turn and turn.is_interrupted.is_set():
+            kill_process_tree(proc.pid)
+            return "⚠️ Interrupted by new prompt"
 
         last_activity = time.time()
         line = line.strip()
@@ -697,6 +784,9 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False):
     except Exception:
         pass
     kill_process_tree(proc.pid)
+
+    if turn and turn.is_interrupted.is_set():
+        return "⚠️ Interrupted by new prompt"
 
     # If any remaining text in buffer
     if current_response_buffer:
@@ -876,8 +966,18 @@ def process_message(target_chat, body, sender_name, media_dict=None):
 
     # If already authenticated -> Check bridge slash commands first (NEVER blocked by busy lock!)
     if is_authenticated:
+        # Command: /stop, /cancel, /halt
+        if body_clean.lower() in ["/stop", "/cancel", "/halt"]:
+            interrupted = interrupt_active_turn(session_key, reason="Stopped by user command")
+            if interrupted:
+                send_whatsapp_message(target_chat, "🛑 *Tarea detenida por el usuario.*")
+            else:
+                send_whatsapp_message(target_chat, "ℹ️ No hay ninguna tarea activa de AGY ejecutándose.")
+            return
+
         # Command: /lock or /logout
         if body_clean.lower() in ["/lock", "/logout", "/exit"]:
+            interrupt_active_turn(session_key, reason="Locked by user")
             with lock:
                 if session_key in active_sessions:
                     del active_sessions[session_key]
@@ -890,6 +990,7 @@ def process_message(target_chat, body, sender_name, media_dict=None):
 
         # Command: /clear or /reset
         if body_clean.lower() in ["/clear", "/reset", "/new"]:
+            interrupt_active_turn(session_key, reason="Cleared by user")
             with lock:
                 chat_history[session_key] = False
                 save_sessions()
@@ -903,6 +1004,7 @@ def process_message(target_chat, body, sender_name, media_dict=None):
         if body_clean.lower() in ["/help", "/commands"]:
             help_text = (
                 "📋 *Antigravity (AGY) WhatsApp Commands:*\n\n"
+                "• `/stop` - Detener inmediatamente la tarea activa de AGY\n"
                 "• `/model` - View dynamic live models & active model\n"
                 "• `/model <name>` - Switch LLM model (e.g. `/model claude-sonnet-5-5-high`)\n"
                 "• `/model refresh` - Pull latest model updates from Google\n"
@@ -1011,38 +1113,47 @@ def process_message(target_chat, body, sender_name, media_dict=None):
         if not actual_prompt:
             return
 
-        # Check concurrency for AGY runs (never call network I/O inside lock!)
-        already_busy = False
-        with lock:
-            if session_key in running_chats:
-                already_busy = True
-            else:
-                running_chats.add(session_key)
+        # Instant Preemption: if a previous task is active for this chat, interrupt it immediately
+        had_interrupted_turn = False
+        old_turn = interrupt_active_turn(session_key, reason="Interrupted by new prompt")
+        if old_turn:
+            had_interrupted_turn = True
+            send_whatsapp_message(target_chat, "⚠️ *[Interrumpido por nuevo mensaje]*")
+            time.sleep(0.35)
 
-        if already_busy:
-            print(f"[Bridge] Busy with active AGY task for {session_key}, notifying user", flush=True)
-            send_whatsapp_message(target_chat, "⏳ *AGY is currently working on your previous request.* Please wait a moment.")
-            return
+        new_turn = ActiveTurn(session_key, target_chat, actual_prompt)
+        with lock:
+            active_turns[session_key] = new_turn
+            running_chats.add(session_key)
 
         try:
             with lock:
                 active_model = user_models.get(session_key, DEFAULT_MODEL)
                 continue_session = chat_history.get(session_key, False)
+                # If we interrupted a running turn, always use --continue to preserve context
+                if had_interrupted_turn:
+                    continue_session = True
 
             print(f"[Bridge] [{session_key}] Running AGY (model={active_model}, continue={continue_session}): {actual_prompt[:60]}...", flush=True)
 
             # Continuous typing indicator active for the entire prompt generation
             typing_indicator = ContinuousTyping(target_chat)
+            new_turn.typing_indicator = typing_indicator
             typing_indicator.start()
             try:
                 if AGY_STREAMING_ENABLED:
-                    agy_reply = stream_agy_prompt(actual_prompt, target_chat, model=active_model, continue_session=continue_session)
+                    agy_reply = stream_agy_prompt(actual_prompt, target_chat, model=active_model, continue_session=continue_session, turn=new_turn)
                 else:
-                    agy_reply = run_agy_prompt(actual_prompt, model=active_model, continue_session=continue_session)
-                    formatted_reply = f"🤖 AGY:\n{agy_reply}"
-                    send_whatsapp_message(target_chat, formatted_reply)
+                    agy_reply = run_agy_prompt(actual_prompt, model=active_model, continue_session=continue_session, turn=new_turn)
+                    if not new_turn.is_interrupted.is_set():
+                        formatted_reply = f"🤖 AGY:\n{agy_reply}"
+                        send_whatsapp_message(target_chat, formatted_reply)
             finally:
                 typing_indicator.stop()
+
+            if new_turn.is_interrupted.is_set():
+                print(f"[Bridge] [{session_key}] Turn was preempted/interrupted, skipping post-run state update.", flush=True)
+                return
 
             with lock:
                 # Refresh inactivity timestamp on completion so long runs don't eat into user timeout
@@ -1052,8 +1163,11 @@ def process_message(target_chat, body, sender_name, media_dict=None):
                     chat_history[session_key] = True
                 save_sessions()
         finally:
+            new_turn.is_completed.set()
             with lock:
-                running_chats.discard(session_key)
+                if active_turns.get(session_key) is new_turn:
+                    del active_turns[session_key]
+                    running_chats.discard(session_key)
         return
 
     # Not authenticated: check for passphrase
