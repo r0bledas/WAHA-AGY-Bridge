@@ -77,6 +77,7 @@ MY_ACCOUNTS = {
 active_sessions = {}                  # {session_key: last_active_timestamp}
 user_models = {}                      # {session_key: model_name}
 chat_history = {}                     # {session_key: bool (has_history)}
+session_targets = {}                  # {session_key: target_chat}
 bot_sent_ids = deque(maxlen=1000)     # Avoid bot reply feedback loops (FIFO)
 bot_sent_texts = deque(maxlen=500)    # Avoid bot reply loops by content match (FIFO)
 processed_msg_ids = deque(maxlen=1000)# Deduplicate incoming webhook deliveries (FIFO)
@@ -169,8 +170,17 @@ def canonical_chat_id(cid):
         return "self"
     return cid
 
+def get_target_chat_for_session(session_key):
+    with lock:
+        target = session_targets.get(session_key)
+        if not target and session_key == "self":
+            target = next((acc for acc in MY_ACCOUNTS if acc.endswith("@c.us")), None) or "5218135537757@c.us"
+        elif not target:
+            target = session_key
+        return target
+
 def load_sessions():
-    global active_sessions, user_models, chat_history
+    global active_sessions, user_models, chat_history, session_targets
     if os.path.exists(SESSIONS_FILE):
         try:
             with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
@@ -180,6 +190,7 @@ def load_sessions():
                     active_sessions = {k: float(v) for k, v in data.get("sessions", {}).items()}
                     user_models = data.get("models", {})
                     chat_history = data.get("history", {})
+                    session_targets = data.get("targets", {})
                 else:
                     active_sessions = {k: float(v) for k, v in data.items()}
                 print(f"[Bridge] Loaded {len(active_sessions)} saved sessions.", flush=True)
@@ -192,12 +203,14 @@ def save_sessions():
             payload = {
                 "sessions": dict(active_sessions),
                 "models": dict(user_models),
-                "history": dict(chat_history)
+                "history": dict(chat_history),
+                "targets": dict(session_targets)
             }
         with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
     except Exception as e:
         print(f"[Bridge] Warning saving sessions: {e}", flush=True)
+
 
 def send_whatsapp_message(chat_id, text):
     stripped = text.strip()
@@ -233,6 +246,39 @@ def send_whatsapp_message(chat_id, text):
             print(f"[Bridge] Error sending message to {chat_id}: {r.status_code} {r.text}", flush=True)
     except Exception as e:
         print(f"[Bridge] Exception sending message: {e}", flush=True)
+
+def session_inactivity_watchdog():
+    """
+    Background daemon thread that periodically checks for inactive sessions.
+    When a session exceeds INACTIVITY_TIMEOUT_SECONDS without messages,
+    it automatically closes the session and sends an expiration notification to WhatsApp.
+    """
+    print(f"[Bridge] Session inactivity watchdog started (timeout: {INACTIVITY_TIMEOUT_SECONDS}s)", flush=True)
+    while True:
+        try:
+            time.sleep(10)
+            now = time.time()
+            expired_sessions = []
+            with lock:
+                for s_key, last_active in list(active_sessions.items()):
+                    if now - last_active >= INACTIVITY_TIMEOUT_SECONDS:
+                        expired_sessions.append(s_key)
+                        del active_sessions[s_key]
+                if expired_sessions:
+                    save_sessions()
+
+            for s_key in expired_sessions:
+                print(f"[Bridge] Session expired due to inactivity for {s_key}", flush=True)
+                target = get_target_chat_for_session(s_key)
+                if target:
+                    msg = (
+                        "🔒 *Session Expired (10m Inactivity)*\n\n"
+                        "Your AGY session has automatically ended due to inactivity.\n"
+                        "Send the passphrase to start a new session."
+                    )
+                    send_whatsapp_message(target, msg)
+        except Exception as e:
+            print(f"[Bridge] Watchdog exception: {e}", flush=True)
 
 def send_presence_online(http_session=None):
     headers = {
@@ -534,11 +580,22 @@ def process_message(target_chat, body, sender_name, media_dict=None):
             if time_since <= INACTIVITY_TIMEOUT_SECONDS:
                 is_authenticated = True
                 active_sessions[session_key] = now
+                session_targets[session_key] = target_chat
                 save_sessions()
             else:
                 print(f"[Bridge] Session expired for {session_key} ({int(time_since)}s > {INACTIVITY_TIMEOUT_SECONDS}s)", flush=True)
                 del active_sessions[session_key]
                 save_sessions()
+
+    # If session was detected as expired on this incoming message
+    if last_active is not None and not is_authenticated:
+        send_whatsapp_message(
+            target_chat,
+            "🔒 *Session Expired (10m Inactivity)*\n\n"
+            "Your AGY session has automatically ended due to inactivity.\n"
+            "Send the passphrase to start a new session."
+        )
+        return
 
     # If already authenticated -> Check bridge slash commands first (NEVER blocked by busy lock!)
     if is_authenticated:
@@ -723,6 +780,7 @@ def process_message(target_chat, body, sender_name, media_dict=None):
     if body_clean == PASSPHRASE:
         with lock:
             active_sessions[session_key] = now
+            session_targets[session_key] = target_chat
             save_sessions()
         welcome_msg = (
             "🔓 *Access Granted!*\n\n"
@@ -867,6 +925,10 @@ def main():
     refresh_my_accounts()
     load_sessions()
     fetch_dynamic_models()  # Pre-fetch models on startup
+
+    watchdog_thread = threading.Thread(target=session_inactivity_watchdog, daemon=True)
+    watchdog_thread.start()
+
     server_address = ("", PORT)
     httpd = BridgeHTTPServer(server_address, WebhookHandler)
     print("=" * 60, flush=True)
