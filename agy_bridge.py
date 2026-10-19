@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -37,10 +38,14 @@ load_dotenv_file(os.path.join(BASE_DIR, ".env"))
 
 PORT = int(os.environ.get("BRIDGE_PORT", "5055"))
 PASSPHRASE = os.environ.get("BRIDGE_PASSPHRASE", "CHANGE_ME_PASSPHRASE")
-INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("INACTIVITY_TIMEOUT_SECONDS", "600"))  # 10 minutes
+INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("INACTIVITY_TIMEOUT_SECONDS", "600"))  # 10 minutes session lock
 WAHA_URL = os.environ.get("WAHA_URL", "http://localhost:3001")
 WAHA_API_KEY = os.environ.get("WAHA_API_KEY", "YOUR_WAHA_API_KEY")
 AGY_DIR = os.environ.get("AGY_DIR", r"C:\Users\T450\Downloads\AGY-Portable-v1.6.0-All-Platforms")
+AGY_STREAMING_ENABLED = os.environ.get("AGY_STREAMING_ENABLED", "True").lower() == "true"
+AGY_INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("AGY_INACTIVITY_TIMEOUT_SECONDS", "90"))
+AGY_MAX_PROMPT_TIMEOUT_SECONDS = int(os.environ.get("AGY_MAX_PROMPT_TIMEOUT_SECONDS", "600"))
+AGY_NOTIFY_TOOL_CALLS = os.environ.get("AGY_NOTIFY_TOOL_CALLS", "True").lower() == "true"
 PORTABLE_HOME = os.path.join(AGY_DIR, "data", "home")
 PORTABLE_DATA = os.path.join(AGY_DIR, "data")
 AGY_EXE = os.path.join(AGY_DIR, "Windows", "bin", "agy.exe")
@@ -481,11 +486,11 @@ def run_agy_prompt(prompt, model=None, continue_session=False):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
             try:
-                proc.wait(timeout=180)
+                proc.wait(timeout=AGY_MAX_PROMPT_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
-                print(f"[Bridge] AGY process {proc.pid} timed out after 180s, killing process tree...", flush=True)
+                print(f"[Bridge] AGY process {proc.pid} timed out after {AGY_MAX_PROMPT_TIMEOUT_SECONDS}s, killing process tree...", flush=True)
                 kill_process_tree(proc.pid)
-                return "⚠️ AGY execution timed out after 3 minutes."
+                return f"⚠️ AGY execution timed out after {AGY_MAX_PROMPT_TIMEOUT_SECONDS // 60} minutes."
 
             # Ensure any lingering grandchild processes are cleaned up
             kill_process_tree(proc.pid)
@@ -518,6 +523,204 @@ def run_agy_prompt(prompt, model=None, continue_session=False):
         if proc and proc.pid:
             kill_process_tree(proc.pid)
         return f"⚠️ Failed to execute AGY: {str(e)}"
+
+def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False):
+    """
+    Executes agy.exe with --output-format stream-json, progressively
+    parsing NDJSON events and dispatching separated responses to WhatsApp.
+    """
+    sync_gemini_md()
+
+    if os.path.exists(AGY_EXE):
+        cmd = [AGY_EXE, "--dangerously-skip-permissions", "--output-format", "stream-json"]
+    else:
+        cmd = [AGY_DANGER_CMD, "--output-format", "stream-json"]
+
+    if model:
+        cmd.extend(["--model", model])
+    if continue_session:
+        cmd.append("--continue")
+    cmd.extend(["-p", prompt])
+
+    print(f"[Bridge-Stream] Spawning: {' '.join(cmd[:5])} -p ...", flush=True)
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=BASE_DIR,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=get_agy_env(),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    except Exception as e:
+        print(f"[Bridge-Stream] Failed to spawn AGY process: {e}", flush=True)
+        return f"⚠️ Failed to spawn AGY: {e}"
+
+    line_queue = queue.Queue()
+    stderr_lines = []
+
+    def stdout_reader():
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                line_queue.put(("STDOUT", line))
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+    def stderr_reader():
+        try:
+            for line in iter(proc.stderr.readline, ""):
+                line_queue.put(("STDERR", line))
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(target=stdout_reader, daemon=True)
+    t_err = threading.Thread(target=stderr_reader, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    start_time = time.time()
+    last_activity = time.time()
+
+    inactivity_timeout = AGY_INACTIVITY_TIMEOUT_SECONDS
+    max_timeout = AGY_MAX_PROMPT_TIMEOUT_SECONDS
+    notify_tools = AGY_NOTIFY_TOOL_CALLS
+
+    current_response_buffer = []
+    sent_messages = set()
+    final_response = None
+    has_sent_intermediate = False
+
+    while True:
+        now = time.time()
+
+        # Check Watchdogs
+        if now - last_activity > inactivity_timeout:
+            print(f"[Bridge-Stream] Process hung (no output for {inactivity_timeout}s). Killing...", flush=True)
+            kill_process_tree(proc.pid)
+            send_whatsapp_message(target_chat, f"⚠️ AGY se congelo ({inactivity_timeout}s sin actividad) y fue cancelado.")
+            return "⚠️ Timed out due to inactivity"
+
+        if now - start_time > max_timeout:
+            print(f"[Bridge-Stream] Process exceeded maximum ceiling of {max_timeout}s. Killing...", flush=True)
+            kill_process_tree(proc.pid)
+            send_whatsapp_message(target_chat, f"⚠️ La tarea supero el tiempo maximo de {max_timeout // 60} minutos.")
+            return "⚠️ Exceeded max timeout"
+
+        try:
+            stream_type, line = line_queue.get(timeout=0.25)
+        except queue.Empty:
+            if proc.poll() is not None and line_queue.empty():
+                break
+            continue
+
+        last_activity = time.time()
+        line = line.strip()
+        if not line:
+            continue
+
+        if stream_type == "STDERR":
+            stderr_lines.append(line)
+            continue
+
+        if stream_type == "STDOUT":
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+
+            event = data.get("event")
+
+            # 1. Capture Agent Response Text Deltas
+            if event == "step_update":
+                step = data.get("step_update", {})
+                step_type = step.get("step_type")
+                state = step.get("state")
+
+                if step_type == "agent_response":
+                    delta = step.get("text_delta", "")
+                    if delta:
+                        current_response_buffer.append(delta)
+
+                    # When an agent conversational turn finishes
+                    if state == "DONE":
+                        chunk = "".join(current_response_buffer).strip()
+                        current_response_buffer = []
+                        if chunk and chunk not in sent_messages:
+                            sent_messages.add(chunk)
+                            has_sent_intermediate = True
+                            send_whatsapp_message(target_chat, f"🤖 AGY:\n{chunk}")
+
+                # 2. Tool Invocation Notifications
+                elif step_type == "tool" and state == "ACTIVE" and notify_tools:
+                    tool_name = step.get("tool_name", "herramienta")
+                    tool_info = step.get("tool_info", {})
+                    params = tool_info.get("parameters", {})
+
+                    param_hint = ""
+                    if "CommandLine" in params:
+                        cmd_p = str(params["CommandLine"]).strip().replace("\r", " ").replace("\n", " ")
+                        param_hint = f" ({cmd_p[:40]}...)" if len(cmd_p) > 40 else f" ({cmd_p})"
+                    elif "TargetFile" in params:
+                        param_hint = f" ({os.path.basename(str(params['TargetFile']))})"
+                    elif "AbsolutePath" in params:
+                        param_hint = f" ({os.path.basename(str(params['AbsolutePath']))})"
+                    elif "query" in params:
+                        q_p = str(params["query"]).strip()
+                        param_hint = f" ('{q_p[:35]}...')" if len(q_p) > 35 else f" ('{q_p}')"
+
+                    send_whatsapp_message(target_chat, f"⚙️ Ejecutando: {tool_name}{param_hint}")
+
+            # 3. Final Result Event
+            elif event == "result":
+                res = data.get("result", {})
+                final_response = res.get("response", "").strip()
+
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+    kill_process_tree(proc.pid)
+
+    # If any remaining text in buffer
+    if current_response_buffer:
+        leftover = "".join(current_response_buffer).strip()
+        if leftover and leftover not in sent_messages:
+            sent_messages.add(leftover)
+            send_whatsapp_message(target_chat, f"🤖 AGY:\n{leftover}")
+
+    # If final response exists and wasn't sent yet
+    if final_response:
+        clean_final = final_response.strip()
+        if clean_final and clean_final not in sent_messages:
+            sent_messages.add(clean_final)
+            send_whatsapp_message(target_chat, f"🤖 AGY:\n{clean_final}")
+            return clean_final
+        return clean_final or "OK"
+    elif not has_sent_intermediate and not sent_messages:
+        if stderr_lines:
+            err_msg = "\n".join(stderr_lines[-5:])
+            send_whatsapp_message(target_chat, f"⚠️ Error en AGY: {err_msg}")
+            return f"⚠️ Error: {err_msg}"
+        send_whatsapp_message(target_chat, "🤖 AGY termino la ejecucion sin generar salida de texto.")
+        return "(No output generated)"
+    return "OK"
 
 def format_model_list(current_model, force_refresh=False):
     models = fetch_dynamic_models(force_refresh=force_refresh)
@@ -832,7 +1035,12 @@ def process_message(target_chat, body, sender_name, media_dict=None):
             typing_indicator = ContinuousTyping(target_chat)
             typing_indicator.start()
             try:
-                agy_reply = run_agy_prompt(actual_prompt, model=active_model, continue_session=continue_session)
+                if AGY_STREAMING_ENABLED:
+                    agy_reply = stream_agy_prompt(actual_prompt, target_chat, model=active_model, continue_session=continue_session)
+                else:
+                    agy_reply = run_agy_prompt(actual_prompt, model=active_model, continue_session=continue_session)
+                    formatted_reply = f"🤖 AGY:\n{agy_reply}"
+                    send_whatsapp_message(target_chat, formatted_reply)
             finally:
                 typing_indicator.stop()
 
@@ -840,12 +1048,9 @@ def process_message(target_chat, body, sender_name, media_dict=None):
                 # Refresh inactivity timestamp on completion so long runs don't eat into user timeout
                 if session_key in active_sessions:
                     active_sessions[session_key] = time.time()
-                if not agy_reply.startswith("⚠️"):
+                if agy_reply and not str(agy_reply).startswith("⚠️"):
                     chat_history[session_key] = True
                 save_sessions()
-
-            formatted_reply = f"🤖 AGY:\n{agy_reply}"
-            send_whatsapp_message(target_chat, formatted_reply)
         finally:
             with lock:
                 running_chats.discard(session_key)
