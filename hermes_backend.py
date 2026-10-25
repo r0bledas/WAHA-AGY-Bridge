@@ -74,6 +74,12 @@ def sync_context():
 
     This is what makes the DeepSeek agent behave like the AGY agent: same
     host instructions (GEMINI.md) and same skills (agentskills.io format).
+
+    Hermes only auto-loads AGENTS.md / CLAUDE.md / .hermes.md / .cursorrules as
+    context files (NOT GEMINI.md), so GEMINI.md is mirrored to AGENTS.md in the
+    working directory. The mirror is SANITIZED: credentials are redacted because
+    the context is sent to the remote DeepSeek API. The tools themselves read
+    their secrets from C:\\waha\\.env at runtime.
     """
     for d in (CONF.profile_dir, CONF.workdir):
         try:
@@ -81,14 +87,43 @@ def sync_context():
         except Exception:
             pass
     if os.path.isfile(CONF.gemini_source):
-        for target in (
-            os.path.join(CONF.profile_dir, "GEMINI.md"),
-            os.path.join(CONF.workdir, "GEMINI.md"),
-        ):
-            try:
-                shutil.copy2(CONF.gemini_source, target)
-            except Exception:
-                pass
+        try:
+            with open(CONF.gemini_source, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except Exception:
+            text = ""
+
+        if text:
+            # Redact credentials before the context goes to the model provider.
+            text = text.replace("5c21c1ce504644a1a527771630209f2f", "[REDACTED_WAHA_API_KEY]")
+            text = text.replace("@Alexandro177", "[REDACTED_NEXUS_PASSWORD]")
+
+            # Hermes' terminal uses its own venv python, which lacks yt-dlp /
+            # requests. Point the documented commands at the system Python.
+            sys_py = r'"C:\Program Files\Python311\python.exe"'
+            text = text.replace("python C:\\waha\\send_file.py", sys_py + " C:\\waha\\send_file.py")
+            text = text.replace("python -m yt_dlp", sys_py + " -m yt_dlp")
+            text = text.replace(
+                "python C:\\waha\\NexusAPI\\nexus_tool.py", sys_py + " C:\\waha\\NexusAPI\\nexus_tool.py"
+            )
+
+            header = (
+                "# WhatsApp Agent Guidelines\n"
+                "This is a sanitized mirror of C:\\waha\\GEMINI.md (secrets redacted).\n"
+                "It is authoritative for formatting, machine identity, file sending, "
+                "video/yt-dlp usage, and integrations.\n\n"
+            )
+            text = header + text
+            for target in (
+                os.path.join(CONF.profile_dir, "GEMINI.md"),
+                os.path.join(CONF.workdir, "GEMINI.md"),
+                os.path.join(CONF.workdir, "AGENTS.md"),
+            ):
+                try:
+                    with open(target, "w", encoding="utf-8") as f:
+                        f.write(text)
+                except Exception:
+                    pass
     if os.path.isdir(CONF.skills_source):
         dst_root = os.path.join(CONF.profile_dir, "skills")
         try:
