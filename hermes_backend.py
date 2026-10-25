@@ -341,7 +341,7 @@ def run(prompt, chat_key, generation, model=None, reasoning=None, on_event=None,
         except Exception:
             continue
         etype = data.get("type")
-        if etype == "tool":
+        if etype in ("tool", "tool_use"):
             tname = (
                 data.get("name")
                 or data.get("tool_name")
@@ -351,7 +351,14 @@ def run(prompt, chat_key, generation, model=None, reasoning=None, on_event=None,
             )
             if on_event:
                 try:
-                    on_event({"type": "tool", "name": str(tname), "data": data})
+                    on_event(
+                        {
+                            "type": "tool",
+                            "name": str(tname),
+                            "input": data.get("input") or {},
+                            "data": data,
+                        }
+                    )
                 except Exception:
                     pass
         elif etype == "text":

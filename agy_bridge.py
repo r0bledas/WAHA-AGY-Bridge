@@ -636,6 +636,31 @@ class HermesTextStreamer:
             self.buffer = ""
 
 
+def _hermes_tool_hint(tool_input):
+    """Best-effort one-line hint (command/path/query) for a Hermes tool call."""
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in (
+        "command",
+        "cmd",
+        "CommandLine",
+        "file_path",
+        "path",
+        "TargetFile",
+        "AbsolutePath",
+        "query",
+        "url",
+        "pattern",
+        "description",
+        "prompt",
+    ):
+        if key in tool_input and tool_input[key]:
+            v = str(tool_input[key]).replace("\r", " ").replace("\n", " ").strip()
+            if v:
+                return f" ({v[:60]}...)" if len(v) > 60 else f" ({v})"
+    return ""
+
+
 def run_hermes_turn(prompt, target_chat, chat_key, generation):
     """Run one Hermes turn, streaming text deltas and tool progress."""
     if hermes_backend is None:
@@ -654,7 +679,8 @@ def run_hermes_turn(prompt, target_chat, chat_key, generation):
     def on_event(ev):
         etype = ev.get("type")
         if etype == "tool":
-            send_tool_note(target_chat, "Ejecutando: " + str(ev.get("name", "tool")))
+            hint = _hermes_tool_hint(ev.get("input") or {})
+            send_tool_note(target_chat, "Ejecutando: " + str(ev.get("name", "tool")) + hint)
         elif etype == "text" and streamer:
             streamer.add(ev.get("text", ""))
         elif etype == "result" and streamer:
