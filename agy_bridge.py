@@ -61,6 +61,12 @@ AGENT_AUTO_FALLBACK = os.environ.get("AGENT_AUTO_FALLBACK", "true").strip().lowe
 AGENT_STATE_FILE = os.path.join(BASE_DIR, "agent_state.json")
 AGY_COOLDOWN_DEFAULT_HOURS = int(os.environ.get("AGY_COOLDOWN_DEFAULT_HOURS", "24"))
 HERMES_COOLDOWN_DEFAULT_MINUTES = int(os.environ.get("HERMES_COOLDOWN_DEFAULT_MINUTES", "30"))
+
+# DeepSeek models available to the Hermes backend (id, display label).
+HERMES_MODELS = [
+    ("deepseek-flash", "DeepSeek V4.1 Flash"),
+    ("deepseek-v4-pro", "DeepSeek V4 Pro"),
+]
 PORTABLE_HOME = os.path.join(AGY_DIR, "data", "home")
 PORTABLE_DATA = os.path.join(AGY_DIR, "data")
 AGY_EXE = os.path.join(AGY_DIR, "Windows", "bin", "agy.exe")
@@ -404,16 +410,43 @@ def switch_agent(session_key, target_chat, arg):
     )
 
 
+def get_hermes_model(session_key):
+    chat = get_chat_agent(session_key)
+    return chat.get("hermes_model") or os.environ.get("HERMES_MODEL", "").strip()
+
+
+def format_hermes_models(session_key):
+    active = get_hermes_model(session_key) or "deepseek-flash"
+    lines = [
+        "*DeepSeek Models (Hermes backend)*",
+        f"Currently Active: `{active}`",
+        "",
+    ]
+    for m_id, label in HERMES_MODELS:
+        marker = "👉 " if m_id == active else "  "
+        suffix = " _[ACTIVE]_" if m_id == active else ""
+        lines.append(f"{marker}`{m_id}` - {label}{suffix}")
+    lines += [
+        "",
+        "💡 *To switch model:*",
+        "Send: `/model <model-id>`",
+        "Example: `/model deepseek-v4-pro`",
+    ]
+    return "\n".join(lines)
+
+
 def run_hermes_turn(prompt, target_chat, chat_key, generation):
     """Run one Hermes turn; tool events are surfaced as coalesced tool notes."""
     if hermes_backend is None:
         return {"text": None, "error": "hermes backend module missing", "code": "unavailable"}
 
+    model = get_hermes_model(chat_key)
+
     def on_event(ev):
         if ev.get("type") == "tool":
             send_tool_note(target_chat, "Ejecutando: " + str(ev.get("name", "tool")))
 
-    return hermes_backend.run(prompt, chat_key, generation, on_event=on_event)
+    return hermes_backend.run(prompt, chat_key, generation, model=model, on_event=on_event)
 
 
 def stop_hermes(chat_key, generation):
@@ -1362,58 +1395,79 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             send_whatsapp_message(target_chat, help_text)
             return
 
-        # Command: /model
-        if body_clean.lower() == "/model" or body_clean.lower().startswith("/model "):
+        # Command: /model (alias: /models)
+        if body_clean.lower() in ("/model", "/models") or body_clean.lower().startswith("/model "):
+            agent_name, _mode = resolve_agent(session_key)
             parts = body_clean.split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+
+            if agent_name == "hermes":
+                if not arg:
+                    send_whatsapp_message(target_chat, format_hermes_models(session_key))
+                    return
+                matched = None
+                for m_id, label in HERMES_MODELS:
+                    if arg.lower() == m_id.lower() or arg.lower() == label.lower() or arg.lower() in m_id.lower():
+                        matched = m_id
+                        break
+                if not matched:
+                    avail = ", ".join(m_id for m_id, _ in HERMES_MODELS)
+                    send_whatsapp_message(target_chat, f"⚠️ *Unknown Hermes model:* `{arg}`\nAvailable: {avail}")
+                    return
+                with lock:
+                    agent_state["chats"].setdefault(session_key, {})["hermes_model"] = matched
+                    save_agent_state()
+                send_whatsapp_message(target_chat, f"🤖 *Hermes model switched to:* `{matched}`\nTakes effect on the next message.")
+                return
+
+            # AGY path
             with lock:
                 active_model = user_models.get(session_key, DEFAULT_MODEL)
-            if len(parts) == 1:
+            if not arg:
                 send_whatsapp_message(target_chat, format_model_list(active_model))
                 return
-            else:
-                arg = parts[1].strip()
-                if arg.lower() == "refresh":
-                    typing_indicator = ContinuousTyping(target_chat)
-                    typing_indicator.start()
-                    try:
-                        reply = format_model_list(active_model, force_refresh=True)
-                    finally:
-                        typing_indicator.stop()
-                    send_whatsapp_message(target_chat, reply)
-                    return
+            if arg.lower() == "refresh":
+                typing_indicator = ContinuousTyping(target_chat)
+                typing_indicator.start()
+                try:
+                    reply = format_model_list(active_model, force_refresh=True)
+                finally:
+                    typing_indicator.stop()
+                send_whatsapp_message(target_chat, reply)
+                return
 
-                # Find matching model from dynamic list
-                models = fetch_dynamic_models()
-                matched_id = None
-                matched_label = None
+            # Find matching model from dynamic list
+            models = fetch_dynamic_models()
+            matched_id = None
+            matched_label = None
 
+            for m_id, label in models:
+                if arg.lower() == m_id.lower() or arg.lower() == label.lower():
+                    matched_id = m_id
+                    matched_label = label
+                    break
+
+            if not matched_id:
                 for m_id, label in models:
-                    if arg.lower() == m_id.lower() or arg.lower() == label.lower():
+                    if arg.lower() in m_id.lower() or arg.lower() in label.lower():
                         matched_id = m_id
                         matched_label = label
                         break
 
-                if not matched_id:
-                    for m_id, label in models:
-                        if arg.lower() in m_id.lower() or arg.lower() in label.lower():
-                            matched_id = m_id
-                            matched_label = label
-                            break
-
-                if matched_id:
-                    with lock:
-                        user_models[session_key] = matched_id
-                        save_sessions()
-                    send_whatsapp_message(
-                        target_chat,
-                        f"🤖 *Model Switched Successfully!*\nActive model is now: *{matched_label}* (`{matched_id}`)"
-                    )
-                else:
-                    send_whatsapp_message(
-                        target_chat,
-                        f"⚠️ *Unknown Model:* `{arg}`\nSend `/model` to see the live list of models provided by AGY."
-                    )
-                return
+            if matched_id:
+                with lock:
+                    user_models[session_key] = matched_id
+                    save_sessions()
+                send_whatsapp_message(
+                    target_chat,
+                    f"🤖 *Model Switched Successfully!*\nActive model is now: *{matched_label}* (`{matched_id}`)"
+                )
+            else:
+                send_whatsapp_message(
+                    target_chat,
+                    f"⚠️ *Unknown Model:* `{arg}`\nSend `/model` to see the live list of models provided by AGY."
+                )
+            return
 
         # Command: /status
         if body_clean.lower() == "/status":
@@ -1494,7 +1548,11 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 generation = chat.get("generation", 1)
 
             agent_name, agent_mode = resolve_agent(session_key)
-            model_label = active_model if agent_name == "agy" else ("deepseek:" + hermes_backend.CONF.model) if (hermes_backend and hermes_backend.CONF.model) else "profile-default"
+            if agent_name == "agy":
+                model_label = active_model
+            else:
+                hm = get_hermes_model(session_key)
+                model_label = ("deepseek:" + hm) if hm else "deepseek:default"
             print(f"[Bridge] [{session_key}] agent={agent_name}/{agent_mode} model={model_label}: {actual_prompt[:60].replace(PASSPHRASE, '***')}...", flush=True)
 
             # Continuous typing indicator active for the entire prompt generation
