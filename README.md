@@ -5,9 +5,9 @@ A lightweight, multi-threaded Python bridge that connects **WhatsApp** (via self
 Two agent backends, one bridge:
 
 - **AGY** — Google Antigravity CLI (primary, `agy.exe`)
-- **Hermes** — [Nous Research Hermes Agent](https://hermes-agent.nousresearch.com) headless CLI running on **DeepSeek** (fallback / alternative)
+- **Hermes** - [Nous Research Hermes Agent](https://hermes-agent.nousresearch.com) headless CLI running on **DeepSeek** (alternative backend)
 
-`/switchagent` picks the backend per chat; `auto` mode runs AGY and falls back to Hermes automatically when AGY hits a quota (429) or fails. The Hermes backend follows the **same `GEMINI.md` instructions and the same skills** as the AGY setup — they are synced into the Hermes profile before every run.
+`/switchagent` cycles or selects the backend per chat. There is **no automatic router**: you choose the agent explicitly, and a quota/error just tells you to switch. The Hermes backend follows the **same `GEMINI.md` instructions and the same skills** as the AGY setup - they are synced into the Hermes profile before every run.
 
 ---
 
@@ -18,9 +18,9 @@ Two agent backends, one bridge:
   - Unauthenticated chats are **100% silent** (zero feedback) unless the exact passphrase (`BRIDGE_PASSPHRASE`) is sent.
   - Automatic session lock after **10 minutes** of inactivity (`INACTIVITY_TIMEOUT_SECONDS`).
 - **Multi-agent routing**:
-  - `/switchagent` — status, pin `agy`/`hermes`, or `auto` fallback mode.
+  - `/switchagent` - cycle to the next agent; `/switchagent agy|hermes` to select; `/switchagent status` for health.
   - Per-chat persistence across bridge restarts (`agent_state.json`).
-  - AGY quota detection with parsed reset cooldowns and automatic Hermes takeover.
+  - AGY quota detection with parsed reset cooldowns (informational; you switch manually).
   - Hermes sessions continue per chat (named sessions with a generation counter; `/clear` starts a fresh one).
 - **Live Dynamic Model Discovery (`/model`)** for AGY:
   - Queries `agy.exe models` directly from the Google CLI with a 1-hour cache and `/model refresh` support.
@@ -49,16 +49,16 @@ Two agent backends, one bridge:
 
 | Command | Description |
 | :--- | :--- |
-| `/switchagent` | Show active agent, mode, and backend health |
-| `/switchagent agy` | Pin this chat to AGY |
-| `/switchagent hermes` | Pin this chat to Hermes (DeepSeek) |
-| `/switchagent auto` | AGY primary with automatic Hermes fallback on quota/outage |
+| `/switchagent` | Cycle to the next agent (agy <-> hermes) |
+| `/switchagent agy` | Select AGY |
+| `/switchagent hermes` | Select Hermes (DeepSeek) |
+| `/switchagent status` | Show current agent and backend health |
 | `/model` | Show the active backend's models (AGY dynamic list or DeepSeek) |
 | `/model <id>` | Switch model (e.g. `/model deepseek-v4-pro`) |
 | `/model <id> <level>` | Switch model + thinking level (e.g. `/model deepseek-v4-pro high`) |
 | `/model refresh` | Force refresh the AGY model list |
-| `/reasoning` | Show the active thinking level (Hermes/DeepSeek) |
-| `/reasoning <level>` | Set thinking level: `none`, `low`, `high`, `max` (aliases: `/thinking`, `/effort`) |
+| `/reasoning` | Show the active model's thinking level (Hermes/DeepSeek) |
+| `/reasoning <level>` | Set that model's thinking level: `none`, `low`, `high`, `max` (remembered per model; aliases: `/thinking`, `/effort`) |
 | `/clear` | Clear chat context and start a fresh session for the active agent |
 | `/status` | Session status, active agent/model, context state, auto-lock countdown |
 | `/stop` | Stop the running AGY or Hermes turn |
@@ -100,8 +100,7 @@ Aliases: `/agent`, `/harness` for `/switchagent`.
 ## Multi-agent configuration (`.env`)
 
 ```
-DEFAULT_AGENT=agy                # agy | hermes
-AGENT_AUTO_FALLBACK=true         # auto mode = primary + fallback
+DEFAULT_AGENT=agy                # initial agent (no auto router)
 AGY_COOLDOWN_DEFAULT_HOURS=24
 HERMES_ENABLED=true
 HERMES_PROFILE=wa

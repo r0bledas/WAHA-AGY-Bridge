@@ -57,7 +57,13 @@ AGY_NOTIFY_TOOL_CALLS = os.environ.get("AGY_NOTIFY_TOOL_CALLS", "True").lower() 
 
 # ── Multi-agent routing (AGY primary, Hermes/DeepSeek fallback) ──
 DEFAULT_AGENT = os.environ.get("DEFAULT_AGENT", "agy").strip().lower() or "agy"
-AGENT_AUTO_FALLBACK = os.environ.get("AGENT_AUTO_FALLBACK", "true").strip().lower() == "true"
+# Agent backends available to /switchagent (cycles in this order).
+# To add a new harness later:
+#   1. Create <name>_backend.py with available() / run() / stop()
+#   2. Add its id to AGENT_CYCLE
+#   3. Add a dispatch branch in process_message (see HARNESS ARCHITECTURE note)
+#   4. Extend /switchagent, /model and /status validation
+AGENT_CYCLE = ["agy", "hermes"]
 AGENT_STATE_FILE = os.path.join(BASE_DIR, "agent_state.json")
 AGY_COOLDOWN_DEFAULT_HOURS = int(os.environ.get("AGY_COOLDOWN_DEFAULT_HOURS", "24"))
 HERMES_COOLDOWN_DEFAULT_MINUTES = int(os.environ.get("HERMES_COOLDOWN_DEFAULT_MINUTES", "30"))
@@ -298,6 +304,13 @@ def load_agent_state():
         print(f"[Bridge] Warning loading agent state: {e}", flush=True)
     agent_state.setdefault("chats", {})
     agent_state.setdefault("backends", {})
+    # Migrate legacy single reasoning value into the per-model map.
+    for _key, chat in agent_state["chats"].items():
+        if not isinstance(chat, dict):
+            continue
+        if chat.get("hermes_reasoning") and not chat.get("hermes_reasoning_by_model"):
+            m = chat.get("hermes_model") or os.environ.get("HERMES_MODEL", "") or "deepseek-flash"
+            chat["hermes_reasoning_by_model"] = {m: chat["hermes_reasoning"]}
 
 
 def save_agent_state():
@@ -354,48 +367,100 @@ def hermes_available():
     return hermes_backend.available()
 
 
+# ══════════════════════════════════════════════════════════════════
+#  HARNESS ARCHITECTURE
+# ══════════════════════════════════════════════════════════════════
+# The bridge is intentionally backend-agnostic. Each "agent" is a harness
+# exposing a tiny interface:
+#
+#   available() -> (bool, reason)
+#   run(prompt, chat_key, generation, model=None, reasoning=None,
+#       on_event=None, on_log=None) -> {text, error, code, session}
+#   stop(chat_key, generation)
+#
+# Current backends:
+#   - agy    : local AGY CLI (streamed), implemented in this file
+#   - hermes : headless Hermes Agent CLI + DeepSeek, hermes_backend.py
+#
+# To add another harness later (OpenCode, Goose, Crush, ...):
+#   1. Create `<name>_backend.py` with the interface above.
+#   2. Import it next to hermes_backend at the top of this file.
+#   3. Append its id to AGENT_CYCLE (below) and to the validation lists
+#      used by /switchagent and the /model handler.
+#   4. Add an `elif agent_name == "<name>":` branch in the turn dispatch
+#      inside process_message (search for: agent_name == "hermes").
+#   5. Extend /status and /model formatting with its models/reasoning.
+#   6. Document new env vars in .env and README.
+#
+# Per-chat state (agent_state.json):
+#   chats[<key>] = {
+#     "pinned": "agy" | "hermes",              # active agent (no auto routing)
+#     "generation": 1,                         # bump on /clear
+#     "hermes_model": "deepseek-v4-pro",
+#     "hermes_reasoning_by_model": {"deepseek-flash": "high", ...}
+#   }
+# ══════════════════════════════════════════════════════════════════
+
+
 def resolve_agent(session_key):
-    """Return (agent_name, mode)."""
+    """Return the active agent for this chat (manual selection, no auto)."""
     chat = get_chat_agent(session_key)
     pinned = chat.get("pinned")
-    if pinned in ("agy", "hermes"):
-        return pinned, "pinned"
-    mode = "auto" if AGENT_AUTO_FALLBACK else "manual"
+    if pinned in AGENT_CYCLE:
+        return pinned, "active"
+    return (DEFAULT_AGENT if DEFAULT_AGENT in AGENT_CYCLE else AGENT_CYCLE[0]), "active"
+
+
+def _agent_status_lines(session_key):
+    agent, _mode = resolve_agent(session_key)
+    lines = [f"*Active agent:* {agent}", "Cycle: " + " -> ".join(AGENT_CYCLE)]
     if backend_on_cooldown("agy"):
-        return "hermes", mode
-    return (DEFAULT_AGENT if DEFAULT_AGENT in ("agy", "hermes") else "agy"), mode
+        cd = agent_state["backends"].get("agy", {}).get("cooldown_until", 0)
+        lines.append("AGY: cooling down until " + time.strftime("%Y-%m-%d %H:%M", time.localtime(cd)))
+    else:
+        lines.append("AGY: OK")
+    ok, why = hermes_available()
+    lines.append("Hermes: " + ("OK" if ok else why))
+    return lines
 
 
 def switch_agent(session_key, target_chat, arg):
+    """No argument cycles to the next agent; an explicit arg selects one."""
     arg = (arg or "").strip().lower()
     if arg == "":
-        agent, mode = resolve_agent(session_key)
-        lines = [
-            f"*Active agent:* {agent} ({mode})",
-            "Available: agy, hermes",
-        ]
-        if backend_on_cooldown("agy"):
-            cd = agent_state["backends"]["agy"].get("cooldown_until", 0)
-            lines.append("AGY: cooling down until " + time.strftime("%Y-%m-%d %H:%M", time.localtime(cd)))
-        else:
-            lines.append("AGY: OK")
-        ok, why = hermes_available()
-        lines.append("Hermes: " + ("OK" if ok else why))
-        send_whatsapp_message(target_chat, "🔄 *Agent Status*\n" + "\n".join(lines))
-        return
-    if arg == "auto":
+        current, _mode = resolve_agent(session_key)
+        try:
+            idx = AGENT_CYCLE.index(current)
+        except ValueError:
+            idx = -1
+        next_agent = AGENT_CYCLE[(idx + 1) % len(AGENT_CYCLE)]
+        if next_agent == "hermes":
+            ok, why = hermes_available()
+            if not ok:
+                send_whatsapp_message(target_chat, f"⚠️ Cannot switch to Hermes: {why}")
+                return
         with lock:
-            agent_state["chats"].setdefault(session_key, {})["pinned"] = None
+            agent_state["chats"].setdefault(session_key, {})["pinned"] = next_agent
             save_agent_state()
+        label = "AGY" if next_agent == "agy" else "Hermes (DeepSeek)"
         send_whatsapp_message(
             target_chat,
-            "🔄 *Auto mode.*\nAGY is primary; Hermes (DeepSeek) takes over on quota/outage.\nUse /switchagent agy or /switchagent hermes to pin one.",
+            f"🔄 Switched to *{label}*.\nNext message uses {label}. Send /switchagent again to cycle back.",
         )
         return
-    if arg not in ("agy", "hermes"):
+    if arg == "status":
+        send_whatsapp_message(target_chat, "🔄 *Agent Status*\n" + "\n".join(_agent_status_lines(session_key)))
+        return
+    if arg == "auto":
         send_whatsapp_message(
             target_chat,
-            "🔄 Usage:\n/switchagent - status\n/switchagent agy\n/switchagent hermes\n/switchagent auto",
+            "🔄 Auto mode was removed. Use /switchagent to cycle agents, or /switchagent agy|hermes.",
+        )
+        return
+    if arg not in AGENT_CYCLE:
+        send_whatsapp_message(
+            target_chat,
+            "🔄 Usage:\n/switchagent - cycle to the next agent\n/switchagent agy\n/switchagent hermes\n/switchagent status",
         )
         return
     if arg == "hermes":
@@ -409,7 +474,7 @@ def switch_agent(session_key, target_chat, arg):
     label = "AGY" if arg == "agy" else "Hermes (DeepSeek)"
     send_whatsapp_message(
         target_chat,
-        f"🔄 Switched this chat to *{label}*.\nNext message uses {label}. Use /switchagent auto for fallback mode.",
+        f"🔄 Switched this chat to *{label}*.\nNext message uses {label}. Send /switchagent to cycle.",
     )
 
 
@@ -418,24 +483,40 @@ def get_hermes_model(session_key):
     return chat.get("hermes_model") or os.environ.get("HERMES_MODEL", "").strip()
 
 
-def get_hermes_reasoning(session_key):
+def _hermes_active_model_key(session_key):
+    return get_hermes_model(session_key) or "deepseek-flash"
+
+
+def get_hermes_reasoning(session_key, model=None):
+    """Thinking level for a model (per-model memory, legacy value fallback)."""
     chat = get_chat_agent(session_key)
-    return chat.get("hermes_reasoning") or ""
+    key = model or _hermes_active_model_key(session_key)
+    by_model = chat.get("hermes_reasoning_by_model") or {}
+    return by_model.get(key) or chat.get("hermes_reasoning") or ""
+
+
+def set_hermes_reasoning(session_key, model, level):
+    with lock:
+        chat = agent_state["chats"].setdefault(session_key, {})
+        by_model = chat.setdefault("hermes_reasoning_by_model", {})
+        by_model[model] = level
+        chat.pop("hermes_reasoning", None)
+        save_agent_state()
 
 
 def format_hermes_models(session_key):
-    active = get_hermes_model(session_key) or "deepseek-flash"
+    active = _hermes_active_model_key(session_key)
     reasoning = get_hermes_reasoning(session_key) or "default"
     lines = [
         "*DeepSeek Models (Hermes backend)*",
-        f"Currently Active: `{active}`",
-        f"Thinking: `{reasoning}`",
+        f"Currently Active: `{active}`  |  Thinking: `{reasoning}`",
         "",
     ]
     for m_id, label in HERMES_MODELS:
         marker = "👉 " if m_id == active else "  "
         suffix = " _[ACTIVE]_" if m_id == active else ""
-        lines.append(f"{marker}`{m_id}` - {label}{suffix}")
+        lvl = get_hermes_reasoning(session_key, m_id) or "default"
+        lines.append(f"{marker}`{m_id}` - {label} (thinking: {lvl}){suffix}")
     lines += [
         "",
         "🧠 *Thinking levels:* " + ", ".join(REASONING_LEVELS),
@@ -1393,7 +1474,9 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
         if body_clean.lower() in ["/help", "/commands"]:
             help_text = (
                 "📋 *WhatsApp Agent Commands:*\n\n"
-                "• `/switchagent` - Show or switch the active agent (agy / hermes / auto)\n"
+                "• `/switchagent` - Cycle to the next agent (agy <-> hermes)\n"
+                "• `/switchagent agy|hermes` - Select an agent\n"
+                "• `/switchagent status` - Show the current agent/health\n"
                 "• `/stop` - Detener inmediatamente la tarea activa\n"
                 "• `/model` - View the active agent's models (AGY or DeepSeek)\n"
                 "• `/model <name>` - Switch LLM model (e.g. `/model deepseek-v4-pro`)\n"
@@ -1443,10 +1526,10 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 with lock:
                     chat = agent_state["chats"].setdefault(session_key, {})
                     chat["hermes_model"] = matched
-                    if level_arg:
-                        chat["hermes_reasoning"] = level_arg
                     save_agent_state()
-                level_label = level_arg or (get_hermes_reasoning(session_key) or "default")
+                if level_arg:
+                    set_hermes_reasoning(session_key, matched, level_arg)
+                level_label = get_hermes_reasoning(session_key, matched) or "default"
                 send_whatsapp_message(
                     target_chat,
                     f"🤖 *Hermes model switched to:* `{matched}`\n🧠 *Thinking:* `{level_label}`\nTakes effect on the next message.",
@@ -1517,10 +1600,11 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 )
                 return
             if not arg:
+                model = _hermes_active_model_key(session_key)
                 current = get_hermes_reasoning(session_key) or "default"
                 send_whatsapp_message(
                     target_chat,
-                    f"🧠 *Thinking level:* `{current}`\nOptions: " + ", ".join(REASONING_LEVELS) + "\nUse: `/reasoning <level>`",
+                    f"🧠 *Thinking for* `{model}`: `{current}`\nOptions: " + ", ".join(REASONING_LEVELS) + "\nUse: `/reasoning <level>`",
                 )
                 return
             if arg not in REASONING_LEVELS:
@@ -1529,10 +1613,9 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                     f"⚠️ *Unknown thinking level:* `{arg}`\nAvailable: " + ", ".join(REASONING_LEVELS),
                 )
                 return
-            with lock:
-                agent_state["chats"].setdefault(session_key, {})["hermes_reasoning"] = arg
-                save_agent_state()
-            send_whatsapp_message(target_chat, f"🧠 *Thinking level set to:* `{arg}`\nTakes effect on the next message.")
+            model = _hermes_active_model_key(session_key)
+            set_hermes_reasoning(session_key, model, arg)
+            send_whatsapp_message(target_chat, f"🧠 *Thinking for* `{model}` set to `{arg}`.\nTakes effect on the next message.")
             return
 
         # Command: /status
@@ -1540,7 +1623,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             with lock:
                 rem = max(0, int(INACTIVITY_TIMEOUT_SECONDS - (time.time() - active_sessions.get(session_key, time.time()))))
                 has_hist = chat_history.get(session_key, False)
-            agent_name, agent_mode = resolve_agent(session_key)
+            agent_name, _mode = resolve_agent(session_key)
             if agent_name == "agy":
                 with lock:
                     active_model = user_models.get(session_key, DEFAULT_MODEL)
@@ -1553,7 +1636,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             send_whatsapp_message(
                 target_chat,
                 f"🟢 *Agent Status: Active*\n"
-                f"• *Agent:* {agent_name} ({agent_mode})\n"
+                f"• *Agent:* {agent_name}\n"
                 f"• *Model:* `{active_model}`\n"
                 f"{thinking_line}"
                 f"• *Context Active:* {'Yes (continuing)' if has_hist else 'No (fresh turn)'}\n"
@@ -1620,14 +1703,14 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 chat = get_chat_agent(session_key)
                 generation = chat.get("generation", 1)
 
-            agent_name, agent_mode = resolve_agent(session_key)
+            agent_name, _ = resolve_agent(session_key)
             if agent_name == "agy":
                 model_label = active_model
             else:
                 hm = get_hermes_model(session_key)
                 hr = get_hermes_reasoning(session_key)
                 model_label = "deepseek:" + (hm or "default") + "/" + (hr or "default")
-            print(f"[Bridge] [{session_key}] agent={agent_name}/{agent_mode} model={model_label}: {actual_prompt[:60].replace(PASSPHRASE, '***')}...", flush=True)
+            print(f"[Bridge] [{session_key}] agent={agent_name} model={model_label}: {actual_prompt[:60].replace(PASSPHRASE, '***')}...", flush=True)
 
             # Continuous typing indicator active for the entire prompt generation
             typing_indicator = ContinuousTyping(target_chat)
@@ -1644,31 +1727,14 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                         err = hermes_res.get("error") or "unknown error"
                         set_backend_cooldown("hermes", HERMES_COOLDOWN_DEFAULT_MINUTES * 60)
                         send_whatsapp_message(target_chat, f"⚠️ Hermes error: {err}")
-                        if agent_mode == "auto" and not backend_on_cooldown("agy"):
-                            send_whatsapp_message(target_chat, "🔁 Falling back to AGY...")
-                            final_reply = _run_agy_turn(actual_prompt, target_chat, session_key, active_model, continue_session, new_turn, typing_indicator)
+                        send_whatsapp_message(target_chat, "💡 Use /switchagent to switch to AGY.")
                 else:
                     final_reply = _run_agy_turn(actual_prompt, target_chat, session_key, active_model, continue_session, new_turn, typing_indicator)
                     if final_reply and agy_quota_hit(final_reply):
                         reset_secs = parse_reset_seconds(final_reply) or (AGY_COOLDOWN_DEFAULT_HOURS * 3600)
                         set_backend_cooldown("agy", reset_secs)
-                        if agent_mode == "auto":
-                            ok, why = hermes_available()
-                            if ok:
-                                send_whatsapp_message(target_chat, "🔁 AGY quota reached. Falling back to Hermes (DeepSeek) for this turn.")
-                                hermes_res = run_hermes_turn(actual_prompt, target_chat, session_key, generation)
-                                if hermes_res.get("code") == "ok" and hermes_res.get("text"):
-                                    final_reply = hermes_res["text"]
-                                    send_whatsapp_message(target_chat, f"🤖 Hermes:\n{final_reply}")
-                                else:
-                                    final_reply = None
-                                    send_whatsapp_message(target_chat, f"⚠️ Hermes fallback failed: {hermes_res.get('error')}")
-                            else:
-                                final_reply = None
-                                send_whatsapp_message(target_chat, f"⚠️ AGY quota reached and Hermes unavailable ({why}). Try /switchagent later.")
-                        else:
-                            final_reply = None
-                            send_whatsapp_message(target_chat, "💡 AGY quota reached. Use /switchagent hermes or /switchagent auto.")
+                        final_reply = None
+                        send_whatsapp_message(target_chat, "💡 AGY quota reached. Use /switchagent to switch to Hermes.")
             finally:
                 typing_indicator.stop()
 
@@ -1701,7 +1767,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             "🔓 *Access Granted!*\n\n"
             "You are now connected to your machine's agents:\n"
             "• *AGY* (Google Antigravity) - primary, `--dangerously-skip-permissions`\n"
-            "• *Hermes* (DeepSeek) - fallback, full terminal access\n\n"
+            "• *Hermes* (DeepSeek) - alternative, full terminal access\n\n"
             "• Send any prompt, code, question, or attach documents & images.\n"
             "• Commands: `/switchagent`, `/model`, `/clear`, `/status`, `/lock`, `/help`\n"
             "• Session auto-locks after *10 minutes* of inactivity."
