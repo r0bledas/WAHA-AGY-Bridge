@@ -1473,9 +1473,13 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
         if body_clean.lower() == "/status":
             with lock:
                 rem = max(0, int(INACTIVITY_TIMEOUT_SECONDS - (time.time() - active_sessions.get(session_key, time.time()))))
-                active_model = user_models.get(session_key, DEFAULT_MODEL)
                 has_hist = chat_history.get(session_key, False)
             agent_name, agent_mode = resolve_agent(session_key)
+            if agent_name == "agy":
+                with lock:
+                    active_model = user_models.get(session_key, DEFAULT_MODEL)
+            else:
+                active_model = get_hermes_model(session_key) or "deepseek-flash"
             mins = rem // 60
             secs = rem % 60
             send_whatsapp_message(
