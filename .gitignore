@@ -23,3 +23,8 @@ __pycache__/
 *.docx
 pip/
 
+
+# Multi-agent routing state
+agent_state.json
+agent_state.json.tmp
+workspace/

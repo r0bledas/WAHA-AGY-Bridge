@@ -10,6 +10,11 @@ from collections import deque
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import requests
 
+try:
+    import hermes_backend
+except Exception:
+    hermes_backend = None
+
 # Reconfigure stdout/stderr for unbuffered UTF-8 on Windows
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -43,9 +48,17 @@ WAHA_URL = os.environ.get("WAHA_URL", "http://localhost:3001")
 WAHA_API_KEY = os.environ.get("WAHA_API_KEY", "YOUR_WAHA_API_KEY")
 AGY_DIR = os.environ.get("AGY_DIR", r"C:\Users\T450\Downloads\AGY-Portable-v1.6.0-All-Platforms")
 AGY_STREAMING_ENABLED = os.environ.get("AGY_STREAMING_ENABLED", "True").lower() == "true"
-AGY_INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("AGY_INACTIVITY_TIMEOUT_SECONDS", "90"))
-AGY_MAX_PROMPT_TIMEOUT_SECONDS = int(os.environ.get("AGY_MAX_PROMPT_TIMEOUT_SECONDS", "600"))
+AGY_INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("AGY_INACTIVITY_TIMEOUT_SECONDS", "600"))
+AGY_MAX_PROMPT_TIMEOUT_SECONDS = int(os.environ.get("AGY_MAX_PROMPT_TIMEOUT_SECONDS", "1800"))
+AGY_TOOL_TIMEOUT_SECONDS = int(os.environ.get("AGY_TOOL_TIMEOUT_SECONDS", "1800"))
 AGY_NOTIFY_TOOL_CALLS = os.environ.get("AGY_NOTIFY_TOOL_CALLS", "True").lower() == "true"
+
+# ── Multi-agent routing (AGY primary, Hermes/DeepSeek fallback) ──
+DEFAULT_AGENT = os.environ.get("DEFAULT_AGENT", "agy").strip().lower() or "agy"
+AGENT_AUTO_FALLBACK = os.environ.get("AGENT_AUTO_FALLBACK", "true").strip().lower() == "true"
+AGENT_STATE_FILE = os.path.join(BASE_DIR, "agent_state.json")
+AGY_COOLDOWN_DEFAULT_HOURS = int(os.environ.get("AGY_COOLDOWN_DEFAULT_HOURS", "24"))
+HERMES_COOLDOWN_DEFAULT_MINUTES = int(os.environ.get("HERMES_COOLDOWN_DEFAULT_MINUTES", "30"))
 PORTABLE_HOME = os.path.join(AGY_DIR, "data", "home")
 PORTABLE_DATA = os.path.join(AGY_DIR, "data")
 AGY_EXE = os.path.join(AGY_DIR, "Windows", "bin", "agy.exe")
@@ -69,7 +82,7 @@ MODELS_CACHE_TTL = 3600  # 1 hour
 DEFAULT_MODEL = "gemini-3.8-flash-medium"
 
 # Bot signature prefixes to immediately discard from incoming webhooks
-BOT_PREFIXES = ("🤖", "🔒", "🔓", "🟢", "⚠️", "🧹", "📋", "⏳")
+BOT_PREFIXES = ("🤖", "🔒", "🔓", "🟢", "⚠️", "🧹", "📋", "⏳", "⚙️", "🔄", "🔁")
 
 # Self-account identifiers (loaded from .env + auto-populated via WAHA /api/sessions/default)
 MY_ACCOUNTS = {
@@ -86,6 +99,12 @@ session_targets = {}                  # {session_key: target_chat}
 bot_sent_ids = deque(maxlen=1000)     # Avoid bot reply feedback loops (FIFO)
 bot_sent_texts = deque(maxlen=500)    # Avoid bot reply loops by content match (FIFO)
 processed_msg_ids = deque(maxlen=1000)# Deduplicate incoming webhook deliveries (FIFO)
+
+# ── Multi-agent state, media batching and tool-note coalescing ──
+agent_state = {"chats": {}, "backends": {}}
+media_batches = {}        # chat -> {"items": [(body, sender_name, media_dict)], "timer": Timer}
+pending_tool_notes = {}   # chat -> {"text", "count", "ts", "timer"}
+last_agy_stderr = []      # tail of most recent AGY stderr lines (for quota detection)
 running_chats = set()                 # Prevent concurrent overlapping runs for the same chat
 cached_models = []                    # [(model_id, label), ...]
 last_models_fetch = 0
@@ -252,6 +271,251 @@ def save_sessions():
         print(f"[Bridge] Warning saving sessions: {e}", flush=True)
 
 
+# ══════════════════════════════════════════════════════════════════
+#  MULTI-AGENT ROUTING (AGY ↔ HERMES) AND RELATED HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def load_agent_state():
+    global agent_state
+    try:
+        if os.path.exists(AGENT_STATE_FILE):
+            with open(AGENT_STATE_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                agent_state = loaded
+    except Exception as e:
+        print(f"[Bridge] Warning loading agent state: {e}", flush=True)
+    agent_state.setdefault("chats", {})
+    agent_state.setdefault("backends", {})
+
+
+def save_agent_state():
+    try:
+        tmp_path = AGENT_STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(agent_state, f, indent=2)
+        os.replace(tmp_path, AGENT_STATE_FILE)
+    except Exception as e:
+        print(f"[Bridge] Warning saving agent state: {e}", flush=True)
+
+
+def get_chat_agent(session_key):
+    with lock:
+        chat = agent_state["chats"].setdefault(session_key, {})
+        chat.setdefault("pinned", None)
+        chat.setdefault("generation", 1)
+        return dict(chat)
+
+
+def backend_on_cooldown(name):
+    cd = agent_state["backends"].get(name, {}).get("cooldown_until", 0) or 0
+    return time.time() < cd
+
+
+def set_backend_cooldown(name, seconds):
+    with lock:
+        entry = agent_state["backends"].setdefault(name, {})
+        entry["cooldown_until"] = time.time() + seconds
+        save_agent_state()
+
+
+def parse_reset_seconds(text):
+    m = re.search(r"resets?\s+in\s+(\d+)\s*h\s*(\d+)\s*m", str(text), re.IGNORECASE)
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60
+    m = re.search(r"(\d+)\s*(?:h|hr|hour)s?", str(text), re.IGNORECASE)
+    if m:
+        return int(m.group(1)) * 3600
+    m = re.search(r"(\d+)\s*(?:m|min|minute)s?", str(text), re.IGNORECASE)
+    if m:
+        return int(m.group(1)) * 60
+    return None
+
+
+def agy_quota_hit(reply_text):
+    blob = " ".join([str(reply_text or "")] + list(last_agy_stderr[-8:]))
+    return bool(re.search(r"RESOURCE_EXHAUSTED|Individual quota reached|429", blob, re.IGNORECASE))
+
+
+def hermes_available():
+    if hermes_backend is None:
+        return False, "hermes backend module missing"
+    return hermes_backend.available()
+
+
+def resolve_agent(session_key):
+    """Return (agent_name, mode)."""
+    chat = get_chat_agent(session_key)
+    pinned = chat.get("pinned")
+    if pinned in ("agy", "hermes"):
+        return pinned, "pinned"
+    mode = "auto" if AGENT_AUTO_FALLBACK else "manual"
+    if backend_on_cooldown("agy"):
+        return "hermes", mode
+    return (DEFAULT_AGENT if DEFAULT_AGENT in ("agy", "hermes") else "agy"), mode
+
+
+def switch_agent(session_key, target_chat, arg):
+    arg = (arg or "").strip().lower()
+    if arg == "":
+        agent, mode = resolve_agent(session_key)
+        lines = [
+            f"*Active agent:* {agent} ({mode})",
+            "Available: agy, hermes",
+        ]
+        if backend_on_cooldown("agy"):
+            cd = agent_state["backends"]["agy"].get("cooldown_until", 0)
+            lines.append("AGY: cooling down until " + time.strftime("%Y-%m-%d %H:%M", time.localtime(cd)))
+        else:
+            lines.append("AGY: OK")
+        ok, why = hermes_available()
+        lines.append("Hermes: " + ("OK" if ok else why))
+        send_whatsapp_message(target_chat, "🔄 *Agent Status*\n" + "\n".join(lines))
+        return
+    if arg == "auto":
+        with lock:
+            agent_state["chats"].setdefault(session_key, {})["pinned"] = None
+            save_agent_state()
+        send_whatsapp_message(
+            target_chat,
+            "🔄 *Auto mode.*\nAGY is primary; Hermes (DeepSeek) takes over on quota/outage.\nUse /switchagent agy or /switchagent hermes to pin one.",
+        )
+        return
+    if arg not in ("agy", "hermes"):
+        send_whatsapp_message(
+            target_chat,
+            "🔄 Usage:\n/switchagent - status\n/switchagent agy\n/switchagent hermes\n/switchagent auto",
+        )
+        return
+    if arg == "hermes":
+        ok, why = hermes_available()
+        if not ok:
+            send_whatsapp_message(target_chat, f"⚠️ Hermes is not available: {why}")
+            return
+    with lock:
+        agent_state["chats"].setdefault(session_key, {})["pinned"] = arg
+        save_agent_state()
+    label = "AGY" if arg == "agy" else "Hermes (DeepSeek)"
+    send_whatsapp_message(
+        target_chat,
+        f"🔄 Switched this chat to *{label}*.\nNext message uses {label}. Use /switchagent auto for fallback mode.",
+    )
+
+
+def run_hermes_turn(prompt, target_chat, chat_key, generation):
+    """Run one Hermes turn; tool events are surfaced as coalesced tool notes."""
+    if hermes_backend is None:
+        return {"text": None, "error": "hermes backend module missing", "code": "unavailable"}
+
+    def on_event(ev):
+        if ev.get("type") == "tool":
+            send_tool_note(target_chat, "Ejecutando: " + str(ev.get("name", "tool")))
+
+    return hermes_backend.run(prompt, chat_key, generation, on_event=on_event)
+
+
+def stop_hermes(chat_key, generation):
+    if hermes_backend is not None:
+        try:
+            hermes_backend.stop(chat_key, generation)
+        except Exception:
+            pass
+
+
+def _run_agy_turn(prompt, target_chat, session_key, model, continue_session, turn, typing_indicator):
+    """Run one AGY turn (streaming or batch). Returns the reply text."""
+    last_agy_stderr.clear()
+    if AGY_STREAMING_ENABLED:
+        return stream_agy_prompt(prompt, target_chat, model=model, continue_session=continue_session, turn=turn)
+    reply = run_agy_prompt(prompt, model=model, continue_session=continue_session, turn=turn)
+    if not turn.is_interrupted.is_set():
+        send_whatsapp_message(target_chat, f"🤖 AGY:\n{reply}")
+    return reply
+
+
+def send_tool_note(chat_id, text):
+    """Send a tool progress note, coalescing identical notes within 1.5s."""
+    now = time.time()
+    with lock:
+        cur = pending_tool_notes.get(chat_id)
+        if cur and cur["text"] == text and (now - cur["ts"]) < 1.5:
+            cur["count"] += 1
+            cur["ts"] = now
+            if cur["timer"]:
+                cur["timer"].cancel()
+            t = threading.Timer(1.2, flush_tool_note, args=(chat_id,))
+            t.daemon = True
+            cur["timer"] = t
+            t.start()
+            return
+        flush_tool_note(chat_id)
+        t = threading.Timer(1.2, flush_tool_note, args=(chat_id,))
+        t.daemon = True
+        pending_tool_notes[chat_id] = {"text": text, "count": 1, "ts": now, "timer": t}
+        t.start()
+
+
+def flush_tool_note(chat_id):
+    with lock:
+        cur = pending_tool_notes.pop(chat_id, None)
+    if not cur:
+        return
+    label = cur["text"]
+    if cur["count"] > 1:
+        label += f" ×{cur['count']}"
+    send_whatsapp_message(chat_id, f"⚙️ {label}")
+
+
+def flush_all_tool_notes():
+    for chat_id in list(pending_tool_notes.keys()):
+        flush_tool_note(chat_id)
+
+
+# ── Media message batching (multi-image = one turn) ──
+
+def dispatch_message(target_chat, body, sender_name, media_dict=None):
+    """Route an incoming message: media messages are debounced/batched."""
+    if media_dict:
+        with lock:
+            batch = media_batches.setdefault(target_chat, {"items": [], "timer": None})
+            batch["items"].append((body, sender_name, media_dict))
+            if batch["timer"] is not None:
+                batch["timer"].cancel()
+            t = threading.Timer(1.8, flush_media_batch, args=(target_chat,))
+            t.daemon = True
+            batch["timer"] = t
+            t.start()
+        return
+    flush_media_batch(target_chat)
+    process_message(target_chat, body, sender_name, None)
+
+
+def flush_media_batch(target_chat):
+    with lock:
+        batch = media_batches.pop(target_chat, None)
+    if not batch or not batch["items"]:
+        return
+    items = batch["items"]
+    sender_name = items[0][1] or "User"
+    bodies = [b.strip() for b, _sn, _m in items if b and str(b).strip()]
+    combined = " ".join(bodies)
+    media_paths = []
+    for _b, _sn, media_dict in items:
+        try:
+            saved_path, _mime = download_media_file(media_dict)
+            if saved_path:
+                media_paths.append(saved_path)
+        except Exception:
+            pass
+    if not media_paths and not combined:
+        return
+    process_message(target_chat, combined, sender_name, None, media_paths=media_paths)
+
+
+# Load persisted per-chat agent selection at import time.
+load_agent_state()
+
+
 def chunk_message(text, max_chars=3500):
     """Splits long messages at paragraph or sentence breaks without altering markdown."""
     if not text:
@@ -337,6 +601,10 @@ def session_inactivity_watchdog():
             expired_sessions = []
             with lock:
                 for s_key, last_active in list(active_sessions.items()):
+                    if s_key in running_chats:
+                        # Keep the session alive while an agent turn is running.
+                        active_sessions[s_key] = now
+                        continue
                     if now - last_active >= INACTIVITY_TIMEOUT_SECONDS:
                         expired_sessions.append(s_key)
                         del active_sessions[s_key]
@@ -600,6 +868,26 @@ def run_agy_prompt(prompt, model=None, continue_session=False, turn=None):
             kill_process_tree(proc.pid)
         return f"⚠️ Failed to execute AGY: {str(e)}"
 
+def _final_delta(final_norm, sent_norm):
+    """Return the portion of final_norm not already sent ("" if fully covered)."""
+    if not final_norm:
+        return ""
+    if final_norm in sent_norm:
+        return ""
+    joined = " ".join(sent_norm)
+    if joined and final_norm.startswith(joined):
+        return final_norm[len(joined):].strip()
+    max_end = 0
+    for s in sent_norm:
+        if len(s) >= 40 and s in final_norm:
+            idx = final_norm.rfind(s)
+            if idx >= 0:
+                max_end = max(max_end, idx + len(s))
+    if max_end > 0:
+        return final_norm[max_end:].strip()
+    return final_norm
+
+
 def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, turn=None):
     """
     Executes agy.exe with --output-format stream-json, progressively
@@ -677,13 +965,16 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, t
     last_activity = time.time()
 
     inactivity_timeout = AGY_INACTIVITY_TIMEOUT_SECONDS
+    tool_timeout = AGY_TOOL_TIMEOUT_SECONDS
     max_timeout = AGY_MAX_PROMPT_TIMEOUT_SECONDS
     notify_tools = AGY_NOTIFY_TOOL_CALLS
 
     current_response_buffer = []
-    sent_messages = set()
+    sent_norm = []
     final_response = None
     has_sent_intermediate = False
+    tool_active = False
+    tool_started = 0.0
 
     while True:
         if turn and turn.is_interrupted.is_set():
@@ -694,7 +985,13 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, t
         now = time.time()
 
         # Check Watchdogs
-        if now - last_activity > inactivity_timeout:
+        if tool_active:
+            if now - tool_started > tool_timeout:
+                print(f"[Bridge-Stream] Tool exceeded {tool_timeout}s. Killing...", flush=True)
+                kill_process_tree(proc.pid)
+                send_whatsapp_message(target_chat, f"⚠️ La herramienta de AGY supero {tool_timeout // 60} minutos y fue cancelada.")
+                return "⚠️ Timed out during tool execution"
+        elif now - last_activity > inactivity_timeout:
             print(f"[Bridge-Stream] Process hung (no output for {inactivity_timeout}s). Killing...", flush=True)
             kill_process_tree(proc.pid)
             send_whatsapp_message(target_chat, f"⚠️ AGY se congelo ({inactivity_timeout}s sin actividad) y fue cancelado.")
@@ -724,6 +1021,9 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, t
 
         if stream_type == "STDERR":
             stderr_lines.append(line)
+            last_agy_stderr.append(line)
+            if len(last_agy_stderr) > 40:
+                last_agy_stderr.pop(0)
             continue
 
         if stream_type == "STDOUT":
@@ -744,35 +1044,47 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, t
                     delta = step.get("text_delta", "")
                     if delta:
                         current_response_buffer.append(delta)
+                        tool_active = False
 
                     # When an agent conversational turn finishes
                     if state == "DONE":
                         chunk = "".join(current_response_buffer).strip()
                         current_response_buffer = []
-                        if chunk and chunk not in sent_messages:
-                            sent_messages.add(chunk)
+                        chunk_norm = " ".join(chunk.split())
+                        if chunk_norm and chunk_norm not in sent_norm:
+                            sent_norm.append(chunk_norm)
                             has_sent_intermediate = True
                             send_whatsapp_message(target_chat, f"🤖 AGY:\n{chunk}")
 
                 # 2. Tool Invocation Notifications
-                elif step_type == "tool" and state == "ACTIVE" and notify_tools:
+                elif step_type == "tool" and notify_tools:
+                    if state == "ACTIVE":
+                        tool_active = True
+                        tool_started = now
+                        last_activity = now
+                    else:
+                        tool_active = False
+                        last_activity = now
+
                     tool_name = step.get("tool_name", "herramienta")
-                    tool_info = step.get("tool_info", {})
-                    params = tool_info.get("parameters", {})
+                    tool_info = step.get("tool_info", {}) or {}
+                    params = tool_info.get("parameters", {}) or {}
 
+                    def _tool_hint(src):
+                        for key in ("CommandLine", "TargetFile", "AbsolutePath", "file_path", "path", "query", "file"):
+                            if key in src:
+                                v = str(src[key]).strip().replace("\r", " ").replace("\n", " ")
+                                if v:
+                                    return v
+                        return ""
+
+                    raw_hint = _tool_hint(params) or _tool_hint(tool_info)
                     param_hint = ""
-                    if "CommandLine" in params:
-                        cmd_p = str(params["CommandLine"]).strip().replace("\r", " ").replace("\n", " ")
-                        param_hint = f" ({cmd_p[:40]}...)" if len(cmd_p) > 40 else f" ({cmd_p})"
-                    elif "TargetFile" in params:
-                        param_hint = f" ({os.path.basename(str(params['TargetFile']))})"
-                    elif "AbsolutePath" in params:
-                        param_hint = f" ({os.path.basename(str(params['AbsolutePath']))})"
-                    elif "query" in params:
-                        q_p = str(params["query"]).strip()
-                        param_hint = f" ('{q_p[:35]}...')" if len(q_p) > 35 else f" ('{q_p}')"
+                    if raw_hint:
+                        param_hint = f" ({raw_hint[:40]}...)" if len(raw_hint) > 40 else f" ({raw_hint})"
 
-                    send_whatsapp_message(target_chat, f"⚙️ Ejecutando: {tool_name}{param_hint}")
+                    if state == "ACTIVE":
+                        send_tool_note(target_chat, f"Ejecutando: {tool_name}{param_hint}")
 
             # 3. Final Result Event
             elif event == "result":
@@ -788,22 +1100,27 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, t
     if turn and turn.is_interrupted.is_set():
         return "⚠️ Interrupted by new prompt"
 
+    flush_tool_note(target_chat)
+
     # If any remaining text in buffer
     if current_response_buffer:
         leftover = "".join(current_response_buffer).strip()
-        if leftover and leftover not in sent_messages:
-            sent_messages.add(leftover)
+        leftover_norm = " ".join(leftover.split())
+        if leftover_norm and leftover_norm not in sent_norm:
+            sent_norm.append(leftover_norm)
             send_whatsapp_message(target_chat, f"🤖 AGY:\n{leftover}")
 
-    # If final response exists and wasn't sent yet
+    # If final response exists, send only the part not already delivered.
     if final_response:
         clean_final = final_response.strip()
-        if clean_final and clean_final not in sent_messages:
-            sent_messages.add(clean_final)
-            send_whatsapp_message(target_chat, f"🤖 AGY:\n{clean_final}")
-            return clean_final
+        final_norm = " ".join(clean_final.split())
+        if final_norm:
+            delta_norm = _final_delta(final_norm, sent_norm)
+            if delta_norm and delta_norm not in sent_norm:
+                sent_norm.append(delta_norm)
+                send_whatsapp_message(target_chat, f"🤖 AGY:\n{delta_norm}")
         return clean_final or "OK"
-    elif not has_sent_intermediate and not sent_messages:
+    elif not has_sent_intermediate and not sent_norm:
         if stderr_lines:
             err_msg = "\n".join(stderr_lines[-5:])
             send_whatsapp_message(target_chat, f"⚠️ Error en AGY: {err_msg}")
@@ -919,7 +1236,7 @@ def handle_tunnel_restart(target_chat):
     except Exception as e:
         print(f"[Bridge] Exception triggering WMI restart: {e}", flush=True)
 
-def process_message(target_chat, body, sender_name, media_dict=None):
+def process_message(target_chat, body, sender_name, media_dict=None, media_paths=None):
     session_key = canonical_chat_id(target_chat)
     now = time.time()
     body_clean = body.strip()
@@ -969,10 +1286,13 @@ def process_message(target_chat, body, sender_name, media_dict=None):
         # Command: /stop, /cancel, /halt
         if body_clean.lower() in ["/stop", "/cancel", "/halt"]:
             interrupted = interrupt_active_turn(session_key, reason="Stopped by user command")
+            with lock:
+                gen = int(agent_state["chats"].setdefault(session_key, {}).get("generation", 1))
+            stop_hermes(session_key, gen)
             if interrupted:
                 send_whatsapp_message(target_chat, "🛑 *Tarea detenida por el usuario.*")
             else:
-                send_whatsapp_message(target_chat, "ℹ️ No hay ninguna tarea activa de AGY ejecutándose.")
+                send_whatsapp_message(target_chat, "ℹ️ No hay ninguna tarea activa ejecutándose.")
             return
 
         # Command: /lock or /logout
@@ -993,18 +1313,34 @@ def process_message(target_chat, body, sender_name, media_dict=None):
             interrupt_active_turn(session_key, reason="Cleared by user")
             with lock:
                 chat_history[session_key] = False
+                chat = agent_state["chats"].setdefault(session_key, {})
+                chat["generation"] = int(chat.get("generation", 1)) + 1
                 save_sessions()
+                save_agent_state()
+            agent_name, _mode = resolve_agent(session_key)
+            label = "AGY" if agent_name == "agy" else "Hermes"
             send_whatsapp_message(
                 target_chat,
-                "🧹 *Chat Context Cleared*\nStarted a fresh AGY session. Your next message will have a clean context."
+                f"🧹 *Chat Context Cleared*\nStarted a fresh {label} session. Your next message will have a clean context."
             )
+            return
+
+        # Command: /switchagent (aliases: /agent, /harness)
+        if body_clean.lower() in ["/switchagent", "/agent", "/harness"] or body_clean.lower().startswith(("/switchagent ", "/agent ", "/harness ")):
+            arg = ""
+            for prefix in ("/switchagent", "/agent", "/harness"):
+                if body_clean.lower().startswith(prefix + " "):
+                    arg = body_clean[len(prefix):].strip()
+                    break
+            switch_agent(session_key, target_chat, arg)
             return
 
         # Command: /help
         if body_clean.lower() in ["/help", "/commands"]:
             help_text = (
-                "📋 *Antigravity (AGY) WhatsApp Commands:*\n\n"
-                "• `/stop` - Detener inmediatamente la tarea activa de AGY\n"
+                "📋 *WhatsApp Agent Commands:*\n\n"
+                "• `/switchagent` - Show or switch the active agent (agy / hermes / auto)\n"
+                "• `/stop` - Detener inmediatamente la tarea activa\n"
                 "• `/model` - View dynamic live models & active model\n"
                 "• `/model <name>` - Switch LLM model (e.g. `/model claude-sonnet-5-5-high`)\n"
                 "• `/model refresh` - Pull latest model updates from Google\n"
@@ -1014,7 +1350,7 @@ def process_message(target_chat, body, sender_name, media_dict=None):
                 "• `///restart` - Hard reset & reboot bridge tunnel if unresponsive\n"
                 "• `/help` - Show this commands list\n\n"
                 "📎 *Documents & Images:*\n"
-                "Attach any PDF, code, document, or image with your prompt to have AGY analyze it directly!"
+                "Attach any PDF, code, document, or image with your prompt to have the agent analyze it directly!"
             )
             send_whatsapp_message(target_chat, help_text)
             return
@@ -1078,37 +1414,51 @@ def process_message(target_chat, body, sender_name, media_dict=None):
                 rem = max(0, int(INACTIVITY_TIMEOUT_SECONDS - (time.time() - active_sessions.get(session_key, time.time()))))
                 active_model = user_models.get(session_key, DEFAULT_MODEL)
                 has_hist = chat_history.get(session_key, False)
+            agent_name, agent_mode = resolve_agent(session_key)
             mins = rem // 60
             secs = rem % 60
             send_whatsapp_message(
                 target_chat,
-                f"🟢 *AGY Status: Active*\n"
+                f"🟢 *Agent Status: Active*\n"
+                f"• *Agent:* {agent_name} ({agent_mode})\n"
                 f"• *Model:* `{active_model}`\n"
                 f"• *Context Active:* {'Yes (continuing)' if has_hist else 'No (fresh turn)'}\n"
                 f"• *Auto-lock in:* {mins}m {secs}s\n\n"
-                f"Commands: `/model`, `/clear`, `/lock`, `/help`"
+                f"Commands: `/switchagent`, `/model`, `/clear`, `/lock`, `/help`"
             )
             return
 
-        # Document / Media Handling
+        # Document / Media Handling (single or multiple attachments)
         actual_prompt = body_clean
+        media_paths = list(media_paths or [])
         if media_dict:
             typing_indicator = ContinuousTyping(target_chat)
             typing_indicator.start()
             try:
-                saved_path, mime = download_media_file(media_dict)
+                saved_path, _mime = download_media_file(media_dict)
             finally:
                 typing_indicator.stop()
 
             if saved_path:
-                fname = os.path.basename(saved_path)
-                if actual_prompt:
-                    actual_prompt = f"The user provided an attached file at '{saved_path}' (file: {fname}, MIME: {mime}).\nUser's prompt: {actual_prompt}"
-                else:
-                    actual_prompt = f"The user provided an attached file at '{saved_path}' (file: {fname}, MIME: {mime}). Please inspect, read, and summarize or analyze this document/image."
+                media_paths.append(saved_path)
             else:
                 send_whatsapp_message(target_chat, "⚠️ Failed to download the attached file from WhatsApp.")
                 return
+
+        if media_paths:
+            unique_paths = []
+            seen = set()
+            for p in media_paths:
+                key = os.path.normcase(os.path.abspath(str(p)))
+                if key not in seen:
+                    seen.add(key)
+                    unique_paths.append(p)
+            file_block = "\n".join(f"- {p}" for p in unique_paths)
+            if actual_prompt:
+                actual_prompt = f"The user provided the following attached file(s):\n{file_block}\n\nUser's prompt: {actual_prompt}"
+            else:
+                actual_prompt = f"The user provided the following attached file(s):\n{file_block}\n\nPlease inspect, read, and summarize or analyze them."
+            print(f"[Bridge] [{session_key}] Attachments: {len(unique_paths)} file(s)", flush=True)
 
         if not actual_prompt:
             return
@@ -1133,21 +1483,52 @@ def process_message(target_chat, body, sender_name, media_dict=None):
                 # If we interrupted a running turn, always use --continue to preserve context
                 if had_interrupted_turn:
                     continue_session = True
+                chat = get_chat_agent(session_key)
+                generation = chat.get("generation", 1)
 
-            print(f"[Bridge] [{session_key}] Running AGY (model={active_model}, continue={continue_session}): {actual_prompt[:60]}...", flush=True)
+            agent_name, agent_mode = resolve_agent(session_key)
+            print(f"[Bridge] [{session_key}] agent={agent_name}/{agent_mode} model={active_model}: {actual_prompt[:60].replace(PASSPHRASE, '***')}...", flush=True)
 
             # Continuous typing indicator active for the entire prompt generation
             typing_indicator = ContinuousTyping(target_chat)
             new_turn.typing_indicator = typing_indicator
             typing_indicator.start()
+            final_reply = None
             try:
-                if AGY_STREAMING_ENABLED:
-                    agy_reply = stream_agy_prompt(actual_prompt, target_chat, model=active_model, continue_session=continue_session, turn=new_turn)
+                if agent_name == "hermes":
+                    hermes_res = run_hermes_turn(actual_prompt, target_chat, session_key, generation)
+                    if hermes_res.get("code") == "ok" and hermes_res.get("text"):
+                        final_reply = hermes_res["text"]
+                        send_whatsapp_message(target_chat, f"🤖 Hermes:\n{final_reply}")
+                    else:
+                        err = hermes_res.get("error") or "unknown error"
+                        set_backend_cooldown("hermes", HERMES_COOLDOWN_DEFAULT_MINUTES * 60)
+                        send_whatsapp_message(target_chat, f"⚠️ Hermes error: {err}")
+                        if agent_mode == "auto" and not backend_on_cooldown("agy"):
+                            send_whatsapp_message(target_chat, "🔁 Falling back to AGY...")
+                            final_reply = _run_agy_turn(actual_prompt, target_chat, session_key, active_model, continue_session, new_turn, typing_indicator)
                 else:
-                    agy_reply = run_agy_prompt(actual_prompt, model=active_model, continue_session=continue_session, turn=new_turn)
-                    if not new_turn.is_interrupted.is_set():
-                        formatted_reply = f"🤖 AGY:\n{agy_reply}"
-                        send_whatsapp_message(target_chat, formatted_reply)
+                    final_reply = _run_agy_turn(actual_prompt, target_chat, session_key, active_model, continue_session, new_turn, typing_indicator)
+                    if final_reply and agy_quota_hit(final_reply):
+                        reset_secs = parse_reset_seconds(final_reply) or (AGY_COOLDOWN_DEFAULT_HOURS * 3600)
+                        set_backend_cooldown("agy", reset_secs)
+                        if agent_mode == "auto":
+                            ok, why = hermes_available()
+                            if ok:
+                                send_whatsapp_message(target_chat, "🔁 AGY quota reached. Falling back to Hermes (DeepSeek) for this turn.")
+                                hermes_res = run_hermes_turn(actual_prompt, target_chat, session_key, generation)
+                                if hermes_res.get("code") == "ok" and hermes_res.get("text"):
+                                    final_reply = hermes_res["text"]
+                                    send_whatsapp_message(target_chat, f"🤖 Hermes:\n{final_reply}")
+                                else:
+                                    final_reply = None
+                                    send_whatsapp_message(target_chat, f"⚠️ Hermes fallback failed: {hermes_res.get('error')}")
+                            else:
+                                final_reply = None
+                                send_whatsapp_message(target_chat, f"⚠️ AGY quota reached and Hermes unavailable ({why}). Try /switchagent later.")
+                        else:
+                            final_reply = None
+                            send_whatsapp_message(target_chat, "💡 AGY quota reached. Use /switchagent hermes or /switchagent auto.")
             finally:
                 typing_indicator.stop()
 
@@ -1159,7 +1540,7 @@ def process_message(target_chat, body, sender_name, media_dict=None):
                 # Refresh inactivity timestamp on completion so long runs don't eat into user timeout
                 if session_key in active_sessions:
                     active_sessions[session_key] = time.time()
-                if agy_reply and not str(agy_reply).startswith("⚠️"):
+                if final_reply and not str(final_reply).startswith("⚠️"):
                     chat_history[session_key] = True
                 save_sessions()
         finally:
@@ -1178,9 +1559,11 @@ def process_message(target_chat, body, sender_name, media_dict=None):
             save_sessions()
         welcome_msg = (
             "🔓 *Access Granted!*\n\n"
-            "You are now connected to *Google Antigravity (AGY)* in `--dangerously-skip-permissions` mode.\n\n"
+            "You are now connected to your machine's agents:\n"
+            "• *AGY* (Google Antigravity) - primary, `--dangerously-skip-permissions`\n"
+            "• *Hermes* (DeepSeek) - fallback, full terminal access\n\n"
             "• Send any prompt, code, question, or attach documents & images.\n"
-            "• Commands: `/model`, `/clear`, `/status`, `/lock`, `/help`\n"
+            "• Commands: `/switchagent`, `/model`, `/clear`, `/status`, `/lock`, `/help`\n"
             "• Session auto-locks after *10 minutes* of inactivity."
         )
         print(f"[Bridge] Authorized access for {session_key} ({sender_name})", flush=True)
@@ -1268,9 +1651,10 @@ def handle_webhook_payload(post_data):
         return
 
     sender_name = payload.get("_data", {}).get("notifyName", "User")
-    print(f"[Bridge] Webhook incoming from {from_chat} (media={has_media}): {body[:50]!r}", flush=True)
+    safe_body = body.replace(PASSPHRASE, "***") if isinstance(body, str) else ""
+    print(f"[Bridge] Webhook incoming from {from_chat} (media={has_media}): {safe_body[:50]!r}", flush=True)
 
-    process_message(target_chat, body, sender_name, media_dict)
+    dispatch_message(target_chat, body, sender_name, media_dict)
 
 class BridgeHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -1346,7 +1730,18 @@ def main():
     sync_gemini_md()
     refresh_my_accounts()
     load_sessions()
+    load_agent_state()
     fetch_dynamic_models()  # Pre-fetch models on startup
+
+    try:
+        ok, _why = hermes_available()
+        if ok:
+            hermes_backend.sync_context()
+            print("[Bridge] Hermes context synced (GEMINI.md + skills).", flush=True)
+        else:
+            print(f"[Bridge] Hermes unavailable at startup: {_why}", flush=True)
+    except Exception as e:
+        print(f"[Bridge] Hermes sync error at startup: {e}", flush=True)
 
     watchdog_thread = threading.Thread(target=session_inactivity_watchdog, daemon=True)
     watchdog_thread.start()
@@ -1358,7 +1753,7 @@ def main():
     print("=" * 60, flush=True)
     print(f"[Bridge] WAHA <-> AGY Bridge running on port {PORT} (Multi-Threaded)", flush=True)
     print(f"[Bridge] My Accounts: {MY_ACCOUNTS}", flush=True)
-    print(f"[Bridge] Security: Passphrase required ('{PASSPHRASE}')", flush=True)
+    print("[Bridge] Security: Passphrase required (********)", flush=True)
     print(f"[Bridge] Inactivity Timeout: {INACTIVITY_TIMEOUT_SECONDS // 60} minutes", flush=True)
     print(f"[Bridge] AGY Executable: {AGY_EXE if os.path.exists(AGY_EXE) else AGY_DANGER_CMD}", flush=True)
     print("=" * 60, flush=True)
