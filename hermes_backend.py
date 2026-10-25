@@ -146,7 +146,7 @@ def classify_error(text):
     return "unknown"
 
 
-def run(prompt, chat_key, generation, model=None, on_event=None, on_log=None):
+def run(prompt, chat_key, generation, model=None, reasoning=None, on_event=None, on_log=None):
     """Run one Hermes turn. Returns a dict with text/error/code/session."""
     ok, why = available()
     if not ok:
@@ -187,6 +187,8 @@ def run(prompt, chat_key, generation, model=None, on_event=None, on_log=None):
         cmd += ["-m", CONF.model]
     elif model:
         cmd += ["-m", model]
+    if reasoning:
+        cmd += ["--reasoning", str(reasoning)]
 
     if on_log:
         try:

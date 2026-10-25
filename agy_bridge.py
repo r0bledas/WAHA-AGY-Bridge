@@ -67,6 +67,9 @@ HERMES_MODELS = [
     ("deepseek-flash", "DeepSeek V4.1 Flash"),
     ("deepseek-v4-pro", "DeepSeek V4 Pro"),
 ]
+
+# Thinking / reasoning effort levels exposed by the bridge (Hermes --reasoning).
+REASONING_LEVELS = ["none", "low", "high", "max"]
 PORTABLE_HOME = os.path.join(AGY_DIR, "data", "home")
 PORTABLE_DATA = os.path.join(AGY_DIR, "data")
 AGY_EXE = os.path.join(AGY_DIR, "Windows", "bin", "agy.exe")
@@ -415,11 +418,18 @@ def get_hermes_model(session_key):
     return chat.get("hermes_model") or os.environ.get("HERMES_MODEL", "").strip()
 
 
+def get_hermes_reasoning(session_key):
+    chat = get_chat_agent(session_key)
+    return chat.get("hermes_reasoning") or ""
+
+
 def format_hermes_models(session_key):
     active = get_hermes_model(session_key) or "deepseek-flash"
+    reasoning = get_hermes_reasoning(session_key) or "default"
     lines = [
         "*DeepSeek Models (Hermes backend)*",
         f"Currently Active: `{active}`",
+        f"Thinking: `{reasoning}`",
         "",
     ]
     for m_id, label in HERMES_MODELS:
@@ -428,9 +438,10 @@ def format_hermes_models(session_key):
         lines.append(f"{marker}`{m_id}` - {label}{suffix}")
     lines += [
         "",
-        "💡 *To switch model:*",
-        "Send: `/model <model-id>`",
-        "Example: `/model deepseek-v4-pro`",
+        "🧠 *Thinking levels:* " + ", ".join(REASONING_LEVELS),
+        "💡 *Switch model:* `/model <model-id>`",
+        "💡 *Switch thinking:* `/reasoning <level>`",
+        "Example: `/model deepseek-v4-pro high`",
     ]
     return "\n".join(lines)
 
@@ -441,12 +452,15 @@ def run_hermes_turn(prompt, target_chat, chat_key, generation):
         return {"text": None, "error": "hermes backend module missing", "code": "unavailable"}
 
     model = get_hermes_model(chat_key)
+    reasoning = get_hermes_reasoning(chat_key)
 
     def on_event(ev):
         if ev.get("type") == "tool":
             send_tool_note(target_chat, "Ejecutando: " + str(ev.get("name", "tool")))
 
-    return hermes_backend.run(prompt, chat_key, generation, model=model, on_event=on_event)
+    return hermes_backend.run(
+        prompt, chat_key, generation, model=model, reasoning=reasoning, on_event=on_event
+    )
 
 
 def stop_hermes(chat_key, generation):
@@ -1381,9 +1395,12 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 "📋 *WhatsApp Agent Commands:*\n\n"
                 "• `/switchagent` - Show or switch the active agent (agy / hermes / auto)\n"
                 "• `/stop` - Detener inmediatamente la tarea activa\n"
-                "• `/model` - View dynamic live models & active model\n"
-                "• `/model <name>` - Switch LLM model (e.g. `/model claude-sonnet-5-5-high`)\n"
-                "• `/model refresh` - Pull latest model updates from Google\n"
+                "• `/model` - View the active agent's models (AGY or DeepSeek)\n"
+                "• `/model <name>` - Switch LLM model (e.g. `/model deepseek-v4-pro`)\n"
+                "• `/model <name> <level>` - Switch model + thinking level (e.g. `/model deepseek-v4-pro high`)\n"
+                "• `/model refresh` - Pull latest model updates (AGY)\n"
+                "• `/reasoning` - Show or set thinking level: none, low, high, max (Hermes)\n"
+                "• `/reasoning <level>` - e.g. `/reasoning high` (aliases: /thinking, /effort)\n"
                 "• `/clear` - Reset context and start a clean session\n"
                 "• `/status` - Check timeout countdown & active model\n"
                 "• `/lock` - Manually lock the session\n"
@@ -1405,19 +1422,35 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 if not arg:
                     send_whatsapp_message(target_chat, format_hermes_models(session_key))
                     return
+                tokens = arg.split()
+                model_arg = tokens[0]
+                level_arg = tokens[1].lower() if len(tokens) > 1 else ""
                 matched = None
                 for m_id, label in HERMES_MODELS:
-                    if arg.lower() == m_id.lower() or arg.lower() == label.lower() or arg.lower() in m_id.lower():
+                    if model_arg.lower() == m_id.lower() or model_arg.lower() == label.lower() or model_arg.lower() in m_id.lower():
                         matched = m_id
                         break
                 if not matched:
                     avail = ", ".join(m_id for m_id, _ in HERMES_MODELS)
-                    send_whatsapp_message(target_chat, f"⚠️ *Unknown Hermes model:* `{arg}`\nAvailable: {avail}")
+                    send_whatsapp_message(target_chat, f"⚠️ *Unknown Hermes model:* `{model_arg}`\nAvailable: {avail}")
+                    return
+                if level_arg and level_arg not in REASONING_LEVELS:
+                    send_whatsapp_message(
+                        target_chat,
+                        f"⚠️ *Unknown thinking level:* `{level_arg}`\nAvailable: " + ", ".join(REASONING_LEVELS),
+                    )
                     return
                 with lock:
-                    agent_state["chats"].setdefault(session_key, {})["hermes_model"] = matched
+                    chat = agent_state["chats"].setdefault(session_key, {})
+                    chat["hermes_model"] = matched
+                    if level_arg:
+                        chat["hermes_reasoning"] = level_arg
                     save_agent_state()
-                send_whatsapp_message(target_chat, f"🤖 *Hermes model switched to:* `{matched}`\nTakes effect on the next message.")
+                level_label = level_arg or (get_hermes_reasoning(session_key) or "default")
+                send_whatsapp_message(
+                    target_chat,
+                    f"🤖 *Hermes model switched to:* `{matched}`\n🧠 *Thinking:* `{level_label}`\nTakes effect on the next message.",
+                )
                 return
 
             # AGY path
@@ -1469,6 +1502,39 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 )
             return
 
+        # Command: /reasoning (aliases: /thinking, /effort)
+        if body_clean.lower() in ["/reasoning", "/thinking", "/effort"] or body_clean.lower().startswith(("/reasoning ", "/thinking ", "/effort ")):
+            agent_name, _mode = resolve_agent(session_key)
+            arg = ""
+            for prefix in ("/reasoning", "/thinking", "/effort"):
+                if body_clean.lower().startswith(prefix + " "):
+                    arg = body_clean[len(prefix):].strip().lower()
+                    break
+            if agent_name != "hermes":
+                send_whatsapp_message(
+                    target_chat,
+                    "🧠 On AGY, the thinking level is part of the model name. Use `/model <name>` with `-low`, `-medium`, or `-high` (e.g. `/model claude-sonnet-5-5-high`).",
+                )
+                return
+            if not arg:
+                current = get_hermes_reasoning(session_key) or "default"
+                send_whatsapp_message(
+                    target_chat,
+                    f"🧠 *Thinking level:* `{current}`\nOptions: " + ", ".join(REASONING_LEVELS) + "\nUse: `/reasoning <level>`",
+                )
+                return
+            if arg not in REASONING_LEVELS:
+                send_whatsapp_message(
+                    target_chat,
+                    f"⚠️ *Unknown thinking level:* `{arg}`\nAvailable: " + ", ".join(REASONING_LEVELS),
+                )
+                return
+            with lock:
+                agent_state["chats"].setdefault(session_key, {})["hermes_reasoning"] = arg
+                save_agent_state()
+            send_whatsapp_message(target_chat, f"🧠 *Thinking level set to:* `{arg}`\nTakes effect on the next message.")
+            return
+
         # Command: /status
         if body_clean.lower() == "/status":
             with lock:
@@ -1478,8 +1544,10 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             if agent_name == "agy":
                 with lock:
                     active_model = user_models.get(session_key, DEFAULT_MODEL)
+                thinking_line = ""
             else:
                 active_model = get_hermes_model(session_key) or "deepseek-flash"
+                thinking_line = f"• *Thinking:* `{get_hermes_reasoning(session_key) or 'default'}`\n"
             mins = rem // 60
             secs = rem % 60
             send_whatsapp_message(
@@ -1487,9 +1555,10 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 f"🟢 *Agent Status: Active*\n"
                 f"• *Agent:* {agent_name} ({agent_mode})\n"
                 f"• *Model:* `{active_model}`\n"
+                f"{thinking_line}"
                 f"• *Context Active:* {'Yes (continuing)' if has_hist else 'No (fresh turn)'}\n"
                 f"• *Auto-lock in:* {mins}m {secs}s\n\n"
-                f"Commands: `/switchagent`, `/model`, `/clear`, `/lock`, `/help`"
+                f"Commands: `/switchagent`, `/model`, `/reasoning`, `/clear`, `/lock`, `/help`"
             )
             return
 
@@ -1556,7 +1625,8 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 model_label = active_model
             else:
                 hm = get_hermes_model(session_key)
-                model_label = ("deepseek:" + hm) if hm else "deepseek:default"
+                hr = get_hermes_reasoning(session_key)
+                model_label = "deepseek:" + (hm or "default") + "/" + (hr or "default")
             print(f"[Bridge] [{session_key}] agent={agent_name}/{agent_mode} model={model_label}: {actual_prompt[:60].replace(PASSPHRASE, '***')}...", flush=True)
 
             # Continuous typing indicator active for the entire prompt generation
