@@ -15,6 +15,8 @@ try:
 except Exception:
     hermes_backend = None
 
+import re
+
 # Reconfigure stdout/stderr for unbuffered UTF-8 on Windows
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -1283,6 +1285,11 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
 
     # If already authenticated -> Check bridge slash commands first (NEVER blocked by busy lock!)
     if is_authenticated:
+        # Sending the passphrase while already unlocked should never reach the agent.
+        if body_clean == PASSPHRASE:
+            send_whatsapp_message(target_chat, "🔓 *Already unlocked.* Send a command or prompt.")
+            return
+
         # Command: /stop, /cancel, /halt
         if body_clean.lower() in ["/stop", "/cancel", "/halt"]:
             interrupted = interrupt_active_turn(session_key, reason="Stopped by user command")
@@ -1487,7 +1494,8 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 generation = chat.get("generation", 1)
 
             agent_name, agent_mode = resolve_agent(session_key)
-            print(f"[Bridge] [{session_key}] agent={agent_name}/{agent_mode} model={active_model}: {actual_prompt[:60].replace(PASSPHRASE, '***')}...", flush=True)
+            model_label = active_model if agent_name == "agy" else ("deepseek:" + hermes_backend.CONF.model) if (hermes_backend and hermes_backend.CONF.model) else "profile-default"
+            print(f"[Bridge] [{session_key}] agent={agent_name}/{agent_mode} model={model_label}: {actual_prompt[:60].replace(PASSPHRASE, '***')}...", flush=True)
 
             # Continuous typing indicator active for the entire prompt generation
             typing_indicator = ContinuousTyping(target_chat)
