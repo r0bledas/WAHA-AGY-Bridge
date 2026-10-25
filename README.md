@@ -19,7 +19,7 @@ Two agent backends, one bridge:
   - Automatic session lock after **10 minutes** of inactivity (`INACTIVITY_TIMEOUT_SECONDS`).
 - **Multi-agent routing**:
   - `/switchagent` - cycle to the next agent; `/switchagent agy|hermes` to select; `/switchagent status` for health.
-  - **Streaming Hermes replies**: token deltas are batched into readable chunks (~400 chars / 2.5 s quiet), with the final result deduplicated so nothing repeats.
+  - **Streaming Hermes replies**: token deltas are batched into readable chunks (~400 chars / 2.5 s quiet), with the final result deduplicated so nothing repeats. Tool progress shows the tool **and its command/path** (e.g. `⚙️ Ejecutando: terminal (echo ...)`).
   - Per-chat persistence across bridge restarts (`agent_state.json`).
   - AGY quota detection with parsed reset cooldowns (informational; you switch manually).
   - Hermes sessions continue per chat (named sessions with a generation counter; `/clear` starts a fresh one).
