@@ -53,9 +53,12 @@ Two agent backends, one bridge:
 | `/switchagent agy` | Pin this chat to AGY |
 | `/switchagent hermes` | Pin this chat to Hermes (DeepSeek) |
 | `/switchagent auto` | AGY primary with automatic Hermes fallback on quota/outage |
-| `/model` | List live AGY models and show the active model |
-| `/model <name>` | Switch AGY LLM model (e.g. `/model claude-sonnet-5-5-high`) |
+| `/model` | Show the active backend's models (AGY dynamic list or DeepSeek) |
+| `/model <id>` | Switch model (e.g. `/model deepseek-v4-pro`) |
+| `/model <id> <level>` | Switch model + thinking level (e.g. `/model deepseek-v4-pro high`) |
 | `/model refresh` | Force refresh the AGY model list |
+| `/reasoning` | Show the active thinking level (Hermes/DeepSeek) |
+| `/reasoning <level>` | Set thinking level: `none`, `low`, `high`, `max` (aliases: `/thinking`, `/effort`) |
 | `/clear` | Clear chat context and start a fresh session for the active agent |
 | `/status` | Session status, active agent/model, context state, auto-lock countdown |
 | `/stop` | Stop the running AGY or Hermes turn |
