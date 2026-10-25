@@ -44,6 +44,13 @@ class HermesConfig:
         self.enabled = (
             os.environ.get("HERMES_ENABLED", "true").strip().lower() == "true"
         )
+        self.stream_text = (
+            os.environ.get("HERMES_STREAM_TEXT", "true").strip().lower() == "true"
+        )
+        self.stream_min_chars = int(os.environ.get("HERMES_STREAM_MIN_CHARS", "400"))
+        self.stream_debounce = float(
+            os.environ.get("HERMES_STREAM_DEBOUNCE_SECONDS", "2.5")
+        )
 
 
 CONF = HermesConfig()
@@ -345,6 +352,14 @@ def run(prompt, chat_key, generation, model=None, reasoning=None, on_event=None,
             if on_event:
                 try:
                     on_event({"type": "tool", "name": str(tname), "data": data})
+                except Exception:
+                    pass
+        elif etype == "text":
+            # Token-level deltas: relay them so the bridge can stream to WhatsApp.
+            txt = data.get("text") or ""
+            if txt and on_event:
+                try:
+                    on_event({"type": "text", "text": txt})
                 except Exception:
                     pass
         elif etype == "result":

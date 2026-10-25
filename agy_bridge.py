@@ -527,21 +527,151 @@ def format_hermes_models(session_key):
     return "\n".join(lines)
 
 
+class HermesTextStreamer:
+    """Relays Hermes token deltas to WhatsApp in readable chunks.
+
+    Deduplicates against the final result text so streaming never repeats the
+    answer (the AGY cumulative-response bug).
+    """
+
+    def __init__(self, chat_id, min_chars=400, debounce=2.5):
+        self.chat_id = chat_id
+        self.min_chars = max(80, int(min_chars))
+        self.debounce = max(0.3, float(debounce))
+        self.buffer = ""
+        self.sent_norm = []
+        self.lock = threading.RLock()
+        self.timer = None
+        self.finished = False
+
+    def add(self, text):
+        if not text:
+            return
+        chunk = ""
+        with self.lock:
+            if self.finished:
+                return
+            self.buffer += text
+            if self.timer:
+                self.timer.cancel()
+                self.timer = None
+            if "\n\n" in self.buffer and len(self.buffer) >= self.min_chars:
+                chunk = self._take_locked(paragraph=True)
+            elif len(self.buffer) >= self.min_chars:
+                chunk = self._take_locked()
+            else:
+                t = threading.Timer(self.debounce, self._flush_timer)
+                t.daemon = True
+                self.timer = t
+                t.start()
+        if chunk:
+            self._send(chunk)
+
+    def _flush_timer(self):
+        chunk = ""
+        with self.lock:
+            if self.finished:
+                return
+            self.timer = None
+            chunk = self._take_locked()
+        if chunk:
+            self._send(chunk)
+
+    def _take_locked(self, paragraph=False):
+        if not self.buffer.strip():
+            self.buffer = ""
+            return ""
+        chunk = self.buffer
+        if paragraph and "\n\n" in chunk:
+            idx = chunk.rfind("\n\n")
+            self.buffer = chunk[idx + 2:]
+            chunk = chunk[:idx]
+        else:
+            self.buffer = ""
+        chunk = chunk.strip()
+        norm = " ".join(chunk.split())
+        if not norm or norm in self.sent_norm:
+            return ""
+        self.sent_norm.append(norm)
+        return chunk
+
+    def _send(self, chunk):
+        try:
+            send_whatsapp_message(self.chat_id, f"🤖 Hermes:\n{chunk}")
+        except Exception:
+            pass
+
+    def finish(self, final_text):
+        chunk = ""
+        with self.lock:
+            if self.finished:
+                return
+            self.finished = True
+            if self.timer:
+                self.timer.cancel()
+                self.timer = None
+            pending = self.buffer.strip()
+            self.buffer = ""
+            final_norm = " ".join((final_text or "").split())
+            if final_norm:
+                delta = _final_delta(final_norm, self.sent_norm)
+            else:
+                delta = pending
+            if pending and pending not in delta:
+                if not delta:
+                    delta = pending
+            delta_norm = " ".join((delta or "").split())
+            if delta_norm and delta_norm not in self.sent_norm:
+                self.sent_norm.append(delta_norm)
+                chunk = delta.strip()
+        if chunk:
+            self._send(chunk)
+
+    def abort(self):
+        with self.lock:
+            self.finished = True
+            if self.timer:
+                self.timer.cancel()
+                self.timer = None
+            self.buffer = ""
+
+
 def run_hermes_turn(prompt, target_chat, chat_key, generation):
-    """Run one Hermes turn; tool events are surfaced as coalesced tool notes."""
+    """Run one Hermes turn, streaming text deltas and tool progress."""
     if hermes_backend is None:
         return {"text": None, "error": "hermes backend module missing", "code": "unavailable"}
 
     model = get_hermes_model(chat_key)
     reasoning = get_hermes_reasoning(chat_key)
+    streamer = None
+    if getattr(hermes_backend.CONF, "stream_text", False):
+        streamer = HermesTextStreamer(
+            target_chat,
+            min_chars=getattr(hermes_backend.CONF, "stream_min_chars", 400),
+            debounce=getattr(hermes_backend.CONF, "stream_debounce", 2.5),
+        )
 
     def on_event(ev):
-        if ev.get("type") == "tool":
+        etype = ev.get("type")
+        if etype == "tool":
             send_tool_note(target_chat, "Ejecutando: " + str(ev.get("name", "tool")))
+        elif etype == "text" and streamer:
+            streamer.add(ev.get("text", ""))
+        elif etype == "result" and streamer:
+            streamer.finish(ev.get("text") or "")
 
-    return hermes_backend.run(
+    result = hermes_backend.run(
         prompt, chat_key, generation, model=model, reasoning=reasoning, on_event=on_event
     )
+    if streamer:
+        if result.get("code") == "ok":
+            streamer.finish(result.get("text") or "")
+        else:
+            streamer.abort()
+        result["streamed"] = True
+    else:
+        result["streamed"] = False
+    return result
 
 
 def stop_hermes(chat_key, generation):
@@ -1722,7 +1852,8 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                     hermes_res = run_hermes_turn(actual_prompt, target_chat, session_key, generation)
                     if hermes_res.get("code") == "ok" and hermes_res.get("text"):
                         final_reply = hermes_res["text"]
-                        send_whatsapp_message(target_chat, f"🤖 Hermes:\n{final_reply}")
+                        if not hermes_res.get("streamed"):
+                            send_whatsapp_message(target_chat, f"🤖 Hermes:\n{final_reply}")
                     else:
                         err = hermes_res.get("error") or "unknown error"
                         set_backend_cooldown("hermes", HERMES_COOLDOWN_DEFAULT_MINUTES * 60)
