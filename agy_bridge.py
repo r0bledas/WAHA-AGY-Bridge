@@ -113,6 +113,7 @@ MY_ACCOUNTS = {
 
 # State tracking
 active_sessions = {}                  # {session_key: last_active_timestamp}
+session_locked = {}                   # {session_key: bool}
 user_models = {}                      # {session_key: model_name}
 chat_history = {}                     # {session_key: bool (has_history)}
 session_targets = {}                  # {session_key: target_chat}
@@ -261,7 +262,7 @@ def get_target_chat_for_session(session_key):
         return target
 
 def load_sessions():
-    global active_sessions, user_models, chat_history, session_targets, user_conversations
+    global active_sessions, user_models, chat_history, session_targets, user_conversations, session_locked
     if os.path.exists(SESSIONS_FILE):
         try:
             with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
@@ -273,11 +274,20 @@ def load_sessions():
                     chat_history = data.get("history", {})
                     session_targets = data.get("targets", {})
                     user_conversations = data.get("conversations", {})
+                    session_locked = data.get("locked", {})
                 else:
                     active_sessions = {k: float(v) for k, v in data.items()}
                 print(f"[Bridge] Loaded {len(active_sessions)} saved sessions.", flush=True)
         except Exception as e:
             print(f"[Bridge] Warning loading sessions: {e}", flush=True)
+
+    # Always ensure owner account ("self") is permanently authenticated unless explicitly /locked
+    with lock:
+        if not session_locked.get("self", False):
+            active_sessions["self"] = time.time()
+            if "self" not in session_targets:
+                session_targets["self"] = next((acc for acc in MY_ACCOUNTS if acc.endswith("@c.us")), None) or "1234567890@c.us"
+    save_sessions()
 
 def save_sessions():
     try:
@@ -288,6 +298,7 @@ def save_sessions():
                 "history": dict(chat_history),
                 "targets": dict(session_targets),
                 "conversations": dict(user_conversations),
+                "locked": dict(session_locked),
             }
         with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -1214,10 +1225,10 @@ def send_whatsapp_message(chat_id, text):
 def session_inactivity_watchdog():
     """
     Background daemon thread that periodically checks for inactive sessions.
-    When a session exceeds INACTIVITY_TIMEOUT_SECONDS without messages,
-    it automatically closes the session and sends an expiration notification to WhatsApp.
+    Owner account ('self') is permanently authenticated and never expires.
     """
-    print(f"[Bridge] Session inactivity watchdog started (timeout: {INACTIVITY_TIMEOUT_SECONDS}s)", flush=True)
+    timeout_desc = f"{INACTIVITY_TIMEOUT_SECONDS}s" if INACTIVITY_TIMEOUT_SECONDS > 0 else "Disabled (Permanent)"
+    print(f"[Bridge] Session inactivity watchdog started (timeout: {timeout_desc}, self=permanent)", flush=True)
     while True:
         try:
             time.sleep(10)
@@ -1229,7 +1240,11 @@ def session_inactivity_watchdog():
                         # Keep the session alive while an agent turn is running.
                         active_sessions[s_key] = now
                         continue
-                    if now - last_active >= INACTIVITY_TIMEOUT_SECONDS:
+                    if s_key == "self":
+                        # Owner account never expires automatically
+                        active_sessions[s_key] = now
+                        continue
+                    if INACTIVITY_TIMEOUT_SECONDS > 0 and (now - last_active >= INACTIVITY_TIMEOUT_SECONDS):
                         expired_sessions.append(s_key)
                         del active_sessions[s_key]
                 if expired_sessions:
@@ -1240,7 +1255,7 @@ def session_inactivity_watchdog():
                 target = get_target_chat_for_session(s_key)
                 if target:
                     msg = (
-                        "🔒 *Session Expired (10m Inactivity)*\n\n"
+                        "🔒 *Session Expired*\n\n"
                         "Your AGY session has automatically ended due to inactivity.\n"
                         "Send the passphrase to start a new session."
                     )
@@ -1903,9 +1918,16 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
         last_active = active_sessions.get(session_key)
         is_authenticated = False
 
-        if last_active is not None:
+        if session_key == "self":
+            # Owner account is permanently authenticated unless explicitly /locked
+            is_authenticated = not session_locked.get("self", False)
+            if is_authenticated:
+                active_sessions[session_key] = now
+                session_targets[session_key] = target_chat
+                save_sessions()
+        elif last_active is not None:
             time_since = now - last_active
-            if time_since <= INACTIVITY_TIMEOUT_SECONDS:
+            if INACTIVITY_TIMEOUT_SECONDS <= 0 or time_since <= INACTIVITY_TIMEOUT_SECONDS:
                 is_authenticated = True
                 active_sessions[session_key] = now
                 session_targets[session_key] = target_chat
@@ -1916,10 +1938,10 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 save_sessions()
 
     # If session was detected as expired on this incoming message
-    if last_active is not None and not is_authenticated:
+    if session_key != "self" and last_active is not None and not is_authenticated:
         send_whatsapp_message(
             target_chat,
-            "🔒 *Session Expired (10m Inactivity)*\n\n"
+            "🔒 *Session Expired*\n\n"
             "Your AGY session has automatically ended due to inactivity.\n"
             "Send the passphrase to start a new session."
         )
@@ -1948,9 +1970,9 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
         if body_clean.lower() in ["/lock", "/logout", "/exit"]:
             interrupt_active_turn(session_key, reason="Locked by user")
             with lock:
-                if session_key in active_sessions:
-                    del active_sessions[session_key]
-                    save_sessions()
+                session_locked[session_key] = True
+                active_sessions.pop(session_key, None)
+                save_sessions()
             send_whatsapp_message(
                 target_chat,
                 "🔒 *Session Locked*\nAGY access has been locked for this chat. Send the passphrase to unlock again."
@@ -2179,8 +2201,12 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 b_src = bound_conv.get("source", "agy").upper()
                 short_id = f"{b_id[:8]}...{b_id[-4:]}" if len(b_id) > 16 else b_id
                 conv_line = f"• *Conversation:* {b_title} (`{short_id}`) [{b_src}]\n"
-            mins = rem // 60
-            secs = rem % 60
+            if session_key == "self" or INACTIVITY_TIMEOUT_SECONDS <= 0:
+                lock_line = "• *Auto-lock:* Disabled (Permanent Session)\n"
+            else:
+                mins = rem // 60
+                secs = rem % 60
+                lock_line = f"• *Auto-lock in:* {mins}m {secs}s\n"
             send_whatsapp_message(
                 target_chat,
                 f"🟢 *Agent Status: Active*\n"
@@ -2189,7 +2215,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 f"{thinking_line}"
                 f"{conv_line}"
                 f"• *Context Active:* {'Yes (continuing)' if has_hist else 'No (fresh turn)'}\n"
-                f"• *Auto-lock in:* {mins}m {secs}s\n\n"
+                f"{lock_line}\n"
                 f"Commands: `/conversation`, `/switchagent`, `/model`, `/reasoning`, `/clear`, `/lock`, `/help`"
             )
             return
@@ -2310,6 +2336,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
     # Not authenticated: check for passphrase
     if body_clean == PASSPHRASE:
         with lock:
+            session_locked.pop(session_key, None)
             active_sessions[session_key] = now
             session_targets[session_key] = target_chat
             save_sessions()
@@ -2319,15 +2346,23 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             "• *AGY* (Google Antigravity) - primary, `--dangerously-skip-permissions`\n"
             "• *Hermes* (DeepSeek) - alternative, full terminal access\n\n"
             "• Send any prompt, code, question, or attach documents & images.\n"
-            "• Commands: `/switchagent`, `/model`, `/clear`, `/status`, `/lock`, `/help`\n"
-            "• Session auto-locks after *10 minutes* of inactivity."
+            "• Commands: `/conversation`, `/switchagent`, `/model`, `/clear`, `/status`, `/lock`, `/help`"
         )
         print(f"[Bridge] Authorized access for {session_key} ({sender_name})", flush=True)
         send_whatsapp_message(target_chat, welcome_msg)
+        return
     else:
-        # STRICT STEALTH MODE: Absolutely NO feedback if passphrase is not sent.
-        # This ensures personal chats, external contacts, and expired sessions remain 100% silent and private.
-        print(f"[Bridge] Silently ignoring message from unauthenticated {session_key} (stealth mode: no feedback)", flush=True)
+        # If the sender is self / owner account: NEVER SILENTLY IGNORE!
+        if session_key == "self" or target_chat in MY_ACCOUNTS:
+            print(f"[Bridge] Owner account {session_key} is locked; prompting for passphrase", flush=True)
+            send_whatsapp_message(
+                target_chat,
+                "🔒 *Session Locked*\nSend your passphrase to unlock and resume chatting."
+            )
+            return
+
+        # STRICT STEALTH MODE: Only for unknown external third parties
+        print(f"[Bridge] Silently ignoring message from unauthenticated external contact {session_key} (stealth mode: no feedback)", flush=True)
         return
 
 def handle_webhook_payload(post_data):
