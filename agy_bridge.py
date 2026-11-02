@@ -710,10 +710,19 @@ def handle_conversation_command(target_chat, session_key, raw_text):
     cmd_token = text_clean.split(maxsplit=1)[0].lower()
     arg = text_clean.split(maxsplit=1)[1].strip() if " " in text_clean else ""
 
+    # Parse hyphenated subactions: e.g. /conversation-new, /conv-new, /conversation-clear, /conv-info, /conversation-next
+    if "-" in cmd_token:
+        pfx, subaction = cmd_token.split("-", 1)
+        if subaction in ["new", "clear", "reset", "info", "current", "status", "next", "prev", "previous", "n", "p"]:
+            arg = subaction + (" " + arg if arg else "")
+            cmd_token = pfx
+
     if cmd_token in ["/conversation-cli", "/conv-cli", "/conversations-cli"]:
         source = "cli"
     elif cmd_token in ["/conversation-other", "/conv-other", "/conversations-other", "/conversation-ide", "/conv-ide", "/conversations-ide"]:
         source = "other"
+    elif cmd_token in ["/conversation-agy", "/conv-agy", "/conversations-agy"]:
+        source = "agy"
     else:
         if arg.lower() == "cli" or arg.lower().startswith("cli "):
             source = "cli"
@@ -722,6 +731,9 @@ def handle_conversation_command(target_chat, session_key, raw_text):
             source = "other"
             tokens = arg.split(maxsplit=1)
             arg = tokens[1].strip() if len(tokens) > 1 else ""
+        elif arg.lower() == "agy" or arg.lower().startswith("agy "):
+            source = "agy"
+            arg = arg[3:].strip()
         else:
             source = "agy"
 
@@ -2148,22 +2160,16 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             )
             return
 
-        # Command: /conversation, /conversation-cli, /conversation-other, /select (and aliases)
+        # Command: /conversation, /conv, /select, /choose, /pick (and any subcommands/hyphenated variants)
         cmd_lower = body_clean.lower()
         if (
             cmd_lower in [
                 "/conversation", "/conversations", "/conv",
-                "/conversation-cli", "/conversations-cli", "/conv-cli",
-                "/conversation-other", "/conversations-other", "/conv-other",
-                "/conversation-ide", "/conversations-ide", "/conv-ide",
                 "/select", "/choose", "/pick",
             ]
             or cmd_lower.startswith((
-                "/conversation ", "/conversations ", "/conv ",
-                "/conversation-cli ", "/conversations-cli ", "/conv-cli ",
-                "/conversation-other ", "/conversations-other ", "/conv-other ",
-                "/conversation-ide ", "/conversations-ide ", "/conv-ide ",
-                "/select ", "/choose ", "/pick ",
+                "/conversation", "/conversations", "/conv",
+                "/select", "/choose", "/pick",
             ))
         ):
             handle_conversation_command(target_chat, session_key, body_clean)
