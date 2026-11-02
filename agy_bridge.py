@@ -2057,6 +2057,36 @@ def handle_tunnel_restart(target_chat):
     except Exception as e:
         print(f"[Bridge] Exception triggering WMI restart: {e}", flush=True)
 
+def get_help_message():
+    return (
+        "📋 *WhatsApp Agent Commands:*\n\n"
+        "• `/conversation` - View AGY conversations (paginated list)\n"
+        "• `/conversation next|prev` - Browse conversation pages (or reply 'next'/'prev')\n"
+        "• `/conversation p <#>` - Jump directly to page #\n"
+        "• `/conversation <1-10>` - Resume conversation (or reply directly with 1-10)\n"
+        "• `/conversation-cli` - View & resume Host CLI conversations\n"
+        "• `/conversation-other` - View & resume Desktop/IDE conversations\n"
+        "• `/conversation new` - Unbind & start fresh conversation\n"
+        "• `/conversation info` - Inspect active conversation details\n"
+        "• `/switchagent` - Cycle to the next agent (agy <-> hermes)\n"
+        "• `/switchagent agy|hermes` - Select an agent\n"
+        "• `/switchagent status` - Show current agent & health\n"
+        "• `/stop` - Detener inmediatamente la tarea activa\n"
+        "• `/model` - View the active agent's models (AGY or DeepSeek)\n"
+        "• `/model <name>` - Switch LLM model (e.g. `/model deepseek-v4-pro`)\n"
+        "• `/model <name> <level>` - Switch model + thinking level (e.g. `/model deepseek-v4-pro high`)\n"
+        "• `/model refresh` - Pull latest model updates (AGY)\n"
+        "• `/reasoning` - Show or set thinking level: none, low, high, max (Hermes)\n"
+        "• `/reasoning <level>` - e.g. `/reasoning high` (aliases: /thinking, /effort)\n"
+        "• `/clear` - Reset context and start a clean session\n"
+        "• `/status` - Check timeout countdown & active model\n"
+        "• `/lock` - Manually lock the session\n"
+        "• `///restart` - Hard reset & reboot bridge tunnel if unresponsive\n"
+        "• `/help` - Show this commands list\n\n"
+        "📎 *Documents & Images:*\n"
+        "Attach any PDF, code, document, or image with your prompt to have the agent analyze it directly!"
+    )
+
 def process_message(target_chat, body, sender_name, media_dict=None, media_paths=None):
     session_key = canonical_chat_id(target_chat)
     now = time.time()
@@ -2187,35 +2217,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
 
         # Command: /help
         if body_clean.lower() in ["/help", "/commands"]:
-            help_text = (
-                "📋 *WhatsApp Agent Commands:*\n\n"
-                "• `/switchagent` - Cycle to the next agent (agy <-> hermes)\n"
-                "• `/switchagent agy|hermes` - Select an agent\n"
-                "• `/switchagent status` - Show the current agent/health\n"
-                "• `/stop` - Detener inmediatamente la tarea activa\n"
-                "• `/conversation` - View AGY conversations (paginated list)\n"
-                "• `/conversation next|prev` - Browse conversation pages (or reply 'next'/'prev')\n"
-                "• `/conversation p <#>` - Jump directly to page #\n"
-                "• `/conversation <1-10>` - Resume conversation (or reply directly with 1-10)\n"
-                "• `/conversation-cli` - View & resume Host CLI conversations\n"
-                "• `/conversation-other` - View & resume Desktop/IDE conversations\n"
-                "• `/conversation new` - Unbind & start fresh conversation\n"
-                "• `/conversation info` - Inspect active conversation details\n"
-                "• `/model` - View the active agent's models (AGY or DeepSeek)\n"
-                "• `/model <name>` - Switch LLM model (e.g. `/model deepseek-v4-pro`)\n"
-                "• `/model <name> <level>` - Switch model + thinking level (e.g. `/model deepseek-v4-pro high`)\n"
-                "• `/model refresh` - Pull latest model updates (AGY)\n"
-                "• `/reasoning` - Show or set thinking level: none, low, high, max (Hermes)\n"
-                "• `/reasoning <level>` - e.g. `/reasoning high` (aliases: /thinking, /effort)\n"
-                "• `/clear` - Reset context and start a clean session\n"
-                "• `/status` - Check timeout countdown & active model\n"
-                "• `/lock` - Manually lock the session\n"
-                "• `///restart` - Hard reset & reboot bridge tunnel if unresponsive\n"
-                "• `/help` - Show this commands list\n\n"
-                "📎 *Documents & Images:*\n"
-                "Attach any PDF, code, document, or image with your prompt to have the agent analyze it directly!"
-            )
-            send_whatsapp_message(target_chat, help_text)
+            send_whatsapp_message(target_chat, get_help_message())
             return
 
         # Command: /model (alias: /models)
@@ -2378,6 +2380,17 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 f"• *Context Active:* {'Yes (continuing)' if has_hist else 'No (fresh turn)'}\n"
                 f"{lock_line}\n"
                 f"Commands: `/conversation`, `/switchagent`, `/model`, `/reasoning`, `/clear`, `/lock`, `/help`"
+            )
+            return
+
+        # Strict Slash Command Interceptor:
+        # Any message that starts with "/" is strictly read as a command.
+        # If it reached here without matching any valid command, report invalid and return available commands.
+        if body_clean.startswith("/"):
+            cmd_token = body_clean.split()[0]
+            send_whatsapp_message(
+                target_chat,
+                f"⚠️ *Unknown or invalid command:* `{cmd_token}`\n\n" + get_help_message()
             )
             return
 
