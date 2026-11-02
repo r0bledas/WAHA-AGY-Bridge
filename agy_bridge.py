@@ -119,6 +119,7 @@ chat_history = {}                     # {session_key: bool (has_history)}
 session_targets = {}                  # {session_key: target_chat}
 user_conversations = {}               # {session_key: {"id": str, "source": str, "title": str}}
 last_listed_conversations = {}        # {session_key: [{"id": str, "title": str, "source": str}]}
+conversation_browsing_state = {}      # {session_key: {"source": str, "page": int, "total_pages": int, "items": list, "awaiting_selection": bool, "ts": float}}
 bot_sent_ids = deque(maxlen=1000)     # Avoid bot reply feedback loops (FIFO)
 bot_sent_texts = deque(maxlen=500)    # Avoid bot reply loops by content match (FIFO)
 processed_msg_ids = deque(maxlen=1000)# Deduplicate incoming webhook deliveries (FIFO)
@@ -429,7 +430,22 @@ def format_conv_timestamp(ts_str):
     except Exception:
         return str(ts_str)[:16]
 
-def fetch_conversations(source="agy", limit=6):
+def count_conversations(source="agy"):
+    src_cfg = CONVERSATION_SOURCES.get(source)
+    if not src_cfg or not os.path.exists(src_cfg["db"]):
+        return 0
+    db_path = src_cfg["db"]
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.cursor()
+        count = cursor.execute("SELECT COUNT(*) FROM conversation_summaries").fetchone()[0]
+        conn.close()
+        return count
+    except Exception as e:
+        print(f"[Bridge] Error counting conversations from {source}: {e}", flush=True)
+        return 0
+
+def fetch_conversations(source="agy", limit=10, offset=0):
     src_cfg = CONVERSATION_SOURCES.get(source)
     if not src_cfg or not os.path.exists(src_cfg["db"]):
         return []
@@ -441,8 +457,8 @@ def fetch_conversations(source="agy", limit=6):
             SELECT conversation_id, title, preview, last_modified_time, step_count
             FROM conversation_summaries
             ORDER BY last_modified_time DESC
-            LIMIT ?
-        ''', (limit,)).fetchall()
+            LIMIT ? OFFSET ?
+        ''', (limit, offset)).fetchall()
         conn.close()
         results = []
         for r in rows:
@@ -505,11 +521,26 @@ def ensure_conversation_available(conv_id, source="agy"):
                 except Exception as e:
                     print(f"[Bridge] Failed copying brain folder {conv_id}: {e}", flush=True)
 
-def format_conversation_list_message(session_key, source="agy", limit=10):
+def format_conversation_list_message(session_key, source="agy", page=1, page_size=10):
     cfg = CONVERSATION_SOURCES.get(source, CONVERSATION_SOURCES["agy"])
-    items = fetch_conversations(source=source, limit=limit)
+    total_count = count_conversations(source=source)
+    total_pages = max(1, (total_count + page_size - 1) // page_size) if total_count > 0 else 1
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * page_size
+    items = fetch_conversations(source=source, limit=page_size, offset=offset)
+
     with lock:
         last_listed_conversations[session_key] = items
+        conversation_browsing_state[session_key] = {
+            "source": source,
+            "page": page,
+            "total_pages": total_pages,
+            "page_size": page_size,
+            "total_count": total_count,
+            "items": items,
+            "awaiting_selection": True,
+            "ts": time.time(),
+        }
         bound_conv = user_conversations.get(session_key)
 
     active_header = ""
@@ -530,23 +561,149 @@ def format_conversation_list_message(session_key, source="agy", limit=10):
             f"Commands: `/conversation`, `/conversation-cli`, `/conversation-other`"
         )
 
-    lines = [f"🗂️ *{cfg['label']} Conversations (Latest {len(items)}):*", "", active_header]
+    page_info = f" • *Page {page} of {total_pages}* ({total_count} total)" if total_count > 0 else ""
+    lines = [f"🗂️ *{cfg['label']} Conversations*{page_info}:", "", active_header]
     for idx, it in enumerate(items, 1):
         is_cur = " 👈 *[ACTIVE]*" if (bound_conv and bound_conv.get("id") == it["id"]) else ""
         lines.append(f"*{idx}.* {it['title']}{is_cur}")
 
     lines.append("")
-    lines.append(f"👉 *Switch/Resume:* `/{cmd_prefix} <1-{len(items)}>` or `/{cmd_prefix} <id>`")
-    lines.append("👉 *Fresh Session:* `/conversation new`")
-    lines.append("👉 *Inspect Current:* `/conversation info`")
-    if source == "agy":
-        lines.append("👉 *Other Sources:* `/conversation-cli`, `/conversation-other`")
-    elif source == "cli":
-        lines.append("👉 *Other Sources:* `/conversation`, `/conversation-other`")
-    else:
-        lines.append("👉 *Other Sources:* `/conversation`, `/conversation-cli`")
+    lines.append(f"🎯 *Select:* Reply `1-{len(items)}` or `/{cmd_prefix} <1-{len(items)}>`")
+
+    # Pagination helpers
+    nav_parts = []
+    if page < total_pages:
+        nav_parts.append(f"`/{cmd_prefix} next` (or `next`)")
+    if page > 1:
+        nav_parts.append(f"`/{cmd_prefix} prev` (or `prev`)")
+    if total_pages > 1:
+        nav_parts.append(f"`/{cmd_prefix} p <1-{total_pages}>`")
+    if nav_parts:
+        lines.append("📄 *Pages:* " + " • ".join(nav_parts))
+
+    # Sources
+    other_sources = []
+    if source != "agy":
+        other_sources.append("`/conversation` (AGY)")
+    if source != "cli":
+        other_sources.append("`/conversation-cli` (CLI)")
+    if source != "other":
+        other_sources.append("`/conversation-other` (IDE)")
+    lines.append("🔄 *Sources:* " + " • ".join(other_sources))
+    lines.append("🧹 *Actions:* `/conversation new` • `/conversation info`")
 
     return "\n".join(lines)
+
+def switch_to_conversation(target_chat, session_key, matched):
+    conv_id = matched["id"]
+    conv_title = matched["title"]
+    match_source = matched.get("source", "agy")
+
+    ensure_conversation_available(conv_id, source=match_source)
+    interrupt_active_turn(session_key, reason="Conversation switched by user")
+
+    agent_name, _ = resolve_agent(session_key)
+    switched_agent_note = ""
+    if agent_name != "agy":
+        with lock:
+            agent_state["chats"].setdefault(session_key, {})["pinned"] = "agy"
+            save_agent_state()
+        switched_agent_note = "\n*(Also switched active agent to AGY)*"
+
+    with lock:
+        user_conversations[session_key] = {
+            "id": conv_id,
+            "source": match_source,
+            "title": conv_title
+        }
+        chat_history[session_key] = True
+        save_sessions()
+
+    src_label = CONVERSATION_SOURCES.get(match_source, {}).get("label", match_source.upper())
+    send_whatsapp_message(
+        target_chat,
+        f"🔄 *Switched to Conversation!*\n\n"
+        f"• *Title:* {conv_title}\n"
+        f"• *ID:* `{conv_id}`\n"
+        f"• *Source:* {src_label}{switched_agent_note}\n\n"
+        f"Your next prompt will continue directly inside this conversation context.\n"
+        f"Send `/conversation info` for details or `/clear` to start fresh."
+    )
+
+def try_handle_conversation_selector(target_chat, session_key, raw_text):
+    """
+    If the user was just looking at a conversation list (within 5 minutes),
+    intercept raw number selectors (e.g. '1', '2', '#3', 'select 2', 'next', 'prev')
+    so they don't have to type long /slash commands on their phone.
+    Returns True if handled, False otherwise.
+    """
+    text_clean = raw_text.strip()
+    if not text_clean or text_clean.startswith("/"):
+        return False
+
+    with lock:
+        browse = conversation_browsing_state.get(session_key)
+        if not browse or not browse.get("awaiting_selection"):
+            return False
+        if time.time() - browse.get("ts", 0) > 300:
+            browse["awaiting_selection"] = False
+            return False
+
+        source = browse.get("source", "agy")
+        page = browse.get("page", 1)
+        total_pages = browse.get("total_pages", 1)
+        items = browse.get("items", [])
+
+    lower_text = text_clean.lower()
+
+    # Paging selectors
+    if lower_text in ["next", "n", "siguiente"]:
+        if page < total_pages:
+            reply = format_conversation_list_message(session_key, source=source, page=page + 1)
+            send_whatsapp_message(target_chat, reply)
+        else:
+            send_whatsapp_message(target_chat, f"ℹ️ You are already on the last page ({total_pages}).")
+        return True
+
+    if lower_text in ["prev", "previous", "p", "back", "anterior"]:
+        if page > 1:
+            reply = format_conversation_list_message(session_key, source=source, page=page - 1)
+            send_whatsapp_message(target_chat, reply)
+        else:
+            send_whatsapp_message(target_chat, "ℹ️ You are already on the first page.")
+        return True
+
+    if lower_text.startswith(("page ", "p ")) or (lower_text.startswith("p") and lower_text[1:].isdigit()):
+        p_arg = lower_text.split()[-1].lstrip("p")
+        if p_arg.isdigit():
+            target_p = int(p_arg)
+            reply = format_conversation_list_message(session_key, source=source, page=target_p)
+            send_whatsapp_message(target_chat, reply)
+            return True
+
+    # Item selectors: "1", "#1", "select 1", "sel 1", "choose 1"
+    sel_arg = ""
+    if text_clean.isdigit():
+        sel_arg = text_clean
+    elif text_clean.startswith("#") and text_clean[1:].isdigit():
+        sel_arg = text_clean[1:]
+    elif lower_text.startswith(("select ", "sel ", "choose ", "pick ")):
+        tokens = text_clean.split(maxsplit=1)
+        if len(tokens) > 1:
+            sel_arg = tokens[1].strip()
+
+    if sel_arg and sel_arg.isdigit():
+        idx = int(sel_arg) - 1
+        if 0 <= idx < len(items):
+            with lock:
+                browse["awaiting_selection"] = False
+            switch_to_conversation(target_chat, session_key, items[idx])
+            return True
+
+    # Normal text prompt -> dismiss selector mode and proceed to agent
+    with lock:
+        browse["awaiting_selection"] = False
+    return False
 
 def handle_conversation_command(target_chat, session_key, raw_text):
     text_clean = raw_text.strip()
@@ -573,6 +730,7 @@ def handle_conversation_command(target_chat, session_key, raw_text):
         with lock:
             user_conversations.pop(session_key, None)
             chat_history[session_key] = False
+            conversation_browsing_state.pop(session_key, None)
             save_sessions()
         send_whatsapp_message(
             target_chat,
@@ -611,8 +769,39 @@ def handle_conversation_command(target_chat, session_key, raw_text):
         )
         return
 
+    # Pagination navigation: next, prev, page <N>, p <N>, p<N>
+    arg_lower = arg.lower()
+    with lock:
+        browse = conversation_browsing_state.get(session_key, {})
+        curr_page = browse.get("page", 1) if browse.get("source") == source else 1
+        total_p = browse.get("total_pages", 1)
+
+    if arg_lower in ["next", "n", "siguiente"]:
+        reply = format_conversation_list_message(session_key, source=source, page=curr_page + 1)
+        send_whatsapp_message(target_chat, reply)
+        return
+
+    if arg_lower in ["prev", "previous", "p", "back", "anterior"]:
+        reply = format_conversation_list_message(session_key, source=source, page=max(1, curr_page - 1))
+        send_whatsapp_message(target_chat, reply)
+        return
+
+    if arg_lower.startswith(("page ", "p ")) or (arg_lower.startswith("p") and arg_lower[1:].isdigit()):
+        tokens = arg_lower.split()
+        p_str = tokens[-1].lstrip("p")
+        if p_str.isdigit():
+            target_page = int(p_str)
+            reply = format_conversation_list_message(session_key, source=source, page=target_page)
+            send_whatsapp_message(target_chat, reply)
+            return
+
+    # Strip selector keywords: "select 3", "choose 3", "pick 3"
+    if arg_lower.startswith(("select ", "choose ", "pick ", "sel ")):
+        tokens = arg.split(maxsplit=1)
+        arg = tokens[1].strip() if len(tokens) > 1 else ""
+
     if not arg:
-        reply = format_conversation_list_message(session_key, source=source, limit=10)
+        reply = format_conversation_list_message(session_key, source=source, page=1)
         send_whatsapp_message(target_chat, reply)
         return
 
@@ -632,7 +821,7 @@ def handle_conversation_command(target_chat, session_key, raw_text):
     if not matched:
         search_sources = [source] + [s for s in CONVERSATION_SOURCES if s != source]
         for src_key in search_sources:
-            pool = fetch_conversations(source=src_key, limit=30)
+            pool = fetch_conversations(source=src_key, limit=50)
             for it in pool:
                 if it["id"].lower() == arg.lower():
                     matched = it
@@ -658,44 +847,15 @@ def handle_conversation_command(target_chat, session_key, raw_text):
         send_whatsapp_message(
             target_chat,
             f"⚠️ *Conversation not found:* `{arg}`\n"
-            f"Send `/{cmd_pfx}` to see the latest conversations with numbers."
+            f"Send `/{cmd_pfx}` to see conversations with selection numbers."
         )
         return
 
-    conv_id = matched["id"]
-    conv_title = matched["title"]
-    match_source = matched.get("source", source)
-
-    ensure_conversation_available(conv_id, source=match_source)
-    interrupt_active_turn(session_key, reason="Conversation switched by user")
-
-    agent_name, _ = resolve_agent(session_key)
-    switched_agent_note = ""
-    if agent_name != "agy":
-        with lock:
-            agent_state["chats"].setdefault(session_key, {})["pinned"] = "agy"
-            save_agent_state()
-        switched_agent_note = "\n*(Also switched active agent to AGY)*"
-
     with lock:
-        user_conversations[session_key] = {
-            "id": conv_id,
-            "source": match_source,
-            "title": conv_title
-        }
-        chat_history[session_key] = True
-        save_sessions()
+        if session_key in conversation_browsing_state:
+            conversation_browsing_state[session_key]["awaiting_selection"] = False
 
-    src_label = CONVERSATION_SOURCES.get(match_source, {}).get("label", match_source.upper())
-    send_whatsapp_message(
-        target_chat,
-        f"🔄 *Switched to Conversation!*\n\n"
-        f"• *Title:* {conv_title}\n"
-        f"• *ID:* `{conv_id}`\n"
-        f"• *Source:* {src_label}{switched_agent_note}\n\n"
-        f"Your next prompt will continue directly inside this conversation context.\n"
-        f"Send `/conversation info` for details or `/clear` to start fresh."
-    )
+    switch_to_conversation(target_chat, session_key, matched)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1975,6 +2135,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             with lock:
                 chat_history[session_key] = False
                 user_conversations.pop(session_key, None)
+                conversation_browsing_state.pop(session_key, None)
                 chat = agent_state["chats"].setdefault(session_key, {})
                 chat["generation"] = int(chat.get("generation", 1)) + 1
                 save_sessions()
@@ -1987,7 +2148,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             )
             return
 
-        # Command: /conversation, /conversation-cli, /conversation-other (and aliases)
+        # Command: /conversation, /conversation-cli, /conversation-other, /select (and aliases)
         cmd_lower = body_clean.lower()
         if (
             cmd_lower in [
@@ -1995,12 +2156,14 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 "/conversation-cli", "/conversations-cli", "/conv-cli",
                 "/conversation-other", "/conversations-other", "/conv-other",
                 "/conversation-ide", "/conversations-ide", "/conv-ide",
+                "/select", "/choose", "/pick",
             ]
             or cmd_lower.startswith((
                 "/conversation ", "/conversations ", "/conv ",
                 "/conversation-cli ", "/conversations-cli ", "/conv-cli ",
                 "/conversation-other ", "/conversations-other ", "/conv-other ",
                 "/conversation-ide ", "/conversations-ide ", "/conv-ide ",
+                "/select ", "/choose ", "/pick ",
             ))
         ):
             handle_conversation_command(target_chat, session_key, body_clean)
@@ -2024,12 +2187,14 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 "• `/switchagent agy|hermes` - Select an agent\n"
                 "• `/switchagent status` - Show the current agent/health\n"
                 "• `/stop` - Detener inmediatamente la tarea activa\n"
-                "• `/conversation` - View & switch AGY conversations\n"
-                "• `/conversation <1-5|id>` - Resume a specific conversation\n"
-                "• `/conversation new` - Unbind & start fresh conversation\n"
-                "• `/conversation info` - Inspect active conversation details\n"
+                "• `/conversation` - View AGY conversations (paginated list)\n"
+                "• `/conversation next|prev` - Browse conversation pages (or reply 'next'/'prev')\n"
+                "• `/conversation p <#>` - Jump directly to page #\n"
+                "• `/conversation <1-10>` - Resume conversation (or reply directly with 1-10)\n"
                 "• `/conversation-cli` - View & resume Host CLI conversations\n"
                 "• `/conversation-other` - View & resume Desktop/IDE conversations\n"
+                "• `/conversation new` - Unbind & start fresh conversation\n"
+                "• `/conversation info` - Inspect active conversation details\n"
                 "• `/model` - View the active agent's models (AGY or DeepSeek)\n"
                 "• `/model <name>` - Switch LLM model (e.g. `/model deepseek-v4-pro`)\n"
                 "• `/model <name> <level>` - Switch model + thinking level (e.g. `/model deepseek-v4-pro high`)\n"
@@ -2208,6 +2373,12 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 f"{lock_line}\n"
                 f"Commands: `/conversation`, `/switchagent`, `/model`, `/reasoning`, `/clear`, `/lock`, `/help`"
             )
+            return
+
+        # Conversational Selector / Paging Interceptor:
+        # If the user was just shown a conversation list, check if this message is a selector
+        # (e.g. "1", "#2", "select 3", "next", "prev", "page 2")
+        if try_handle_conversation_selector(target_chat, session_key, body_clean):
             return
 
         # Document / Media Handling (single or multiple attachments)
