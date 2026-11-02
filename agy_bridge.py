@@ -505,7 +505,7 @@ def ensure_conversation_available(conv_id, source="agy"):
                 except Exception as e:
                     print(f"[Bridge] Failed copying brain folder {conv_id}: {e}", flush=True)
 
-def format_conversation_list_message(session_key, source="agy", limit=5):
+def format_conversation_list_message(session_key, source="agy", limit=10):
     cfg = CONVERSATION_SOURCES.get(source, CONVERSATION_SOURCES["agy"])
     items = fetch_conversations(source=source, limit=limit)
     with lock:
@@ -514,12 +514,11 @@ def format_conversation_list_message(session_key, source="agy", limit=5):
 
     active_header = ""
     if bound_conv:
-        b_id = bound_conv.get("id", "")
         b_title = bound_conv.get("title", "Untitled")
         b_src = bound_conv.get("source", "agy").upper()
-        active_header = f"👉 *Active Bound Session:* {b_title}\n   (`{b_id}`) _[{b_src}]_\n\n"
+        active_header = f"👉 *Active:* {b_title} _[{b_src}]_\n\n"
     else:
-        active_header = "👉 *Active Bound Session:* _(None - next prompt creates/continues default)_\n\n"
+        active_header = "👉 *Active:* _(None - next prompt creates default)_\n\n"
 
     cmd_prefix = "conversation" if source == "agy" else f"conversation-{source}"
 
@@ -533,19 +532,10 @@ def format_conversation_list_message(session_key, source="agy", limit=5):
 
     lines = [f"🗂️ *{cfg['label']} Conversations (Latest {len(items)}):*", "", active_header]
     for idx, it in enumerate(items, 1):
-        m_time = format_conv_timestamp(it["modified"])
-        steps_str = f" • {it['steps']} steps" if it['steps'] else ""
-        is_cur = " 👈 *[BOUND]*" if (bound_conv and bound_conv.get("id") == it["id"]) else ""
-        lines.append(f"*{idx}.* *{it['title']}*{is_cur}")
-        lines.append(f"   • ID: `{it['id']}`")
-        lines.append(f"   • Modified: {m_time}{steps_str}")
-        if it["preview"] and it["preview"] != it["title"]:
-            short_prev = it["preview"].replace("\n", " ").strip()
-            if len(short_prev) > 60:
-                short_prev = short_prev[:60] + "..."
-            lines.append(f"   • Preview: _{short_prev}_")
-        lines.append("")
+        is_cur = " 👈 *[ACTIVE]*" if (bound_conv and bound_conv.get("id") == it["id"]) else ""
+        lines.append(f"*{idx}.* {it['title']}{is_cur}")
 
+    lines.append("")
     lines.append(f"👉 *Switch/Resume:* `/{cmd_prefix} <1-{len(items)}>` or `/{cmd_prefix} <id>`")
     lines.append("👉 *Fresh Session:* `/conversation new`")
     lines.append("👉 *Inspect Current:* `/conversation info`")
@@ -622,7 +612,7 @@ def handle_conversation_command(target_chat, session_key, raw_text):
         return
 
     if not arg:
-        reply = format_conversation_list_message(session_key, source=source, limit=5)
+        reply = format_conversation_list_message(session_key, source=source, limit=10)
         send_whatsapp_message(target_chat, reply)
         return
 
@@ -635,7 +625,7 @@ def handle_conversation_command(target_chat, session_key, raw_text):
         if 0 <= idx < len(cached_items):
             matched = cached_items[idx]
         else:
-            fresh_items = fetch_conversations(source=source, limit=max(idx + 1, 5))
+            fresh_items = fetch_conversations(source=source, limit=max(idx + 1, 10))
             if 0 <= idx < len(fresh_items):
                 matched = fresh_items[idx]
 
