@@ -70,6 +70,7 @@ def guess_mime(file_path):
         ".txt": "text/plain",
         ".py": "text/plain",
         ".zip": "application/zip",
+        ".apk": "application/vnd.android.package-archive",
     }
     return fallback_map.get(ext, "application/octet-stream")
 
@@ -110,7 +111,7 @@ def send_file(file_path, caption="", chat_id=None):
 
     url = f"{WAHA_URL}/api/sendFile"
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=45)
+        r = requests.post(url, json=payload, headers=headers, timeout=180)
         if r.status_code in [200, 201]:
             print(f"[OK] Successfully sent {filename} to {target_chat} ({len(b64_data)} b64 bytes)")
             return True

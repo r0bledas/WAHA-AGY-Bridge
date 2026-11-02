@@ -16,6 +16,9 @@ except Exception:
     hermes_backend = None
 
 import re
+import sqlite3
+import datetime
+import shutil
 
 # Reconfigure stdout/stderr for unbuffered UTF-8 on Windows
 if hasattr(sys.stdout, "reconfigure"):
@@ -113,6 +116,8 @@ active_sessions = {}                  # {session_key: last_active_timestamp}
 user_models = {}                      # {session_key: model_name}
 chat_history = {}                     # {session_key: bool (has_history)}
 session_targets = {}                  # {session_key: target_chat}
+user_conversations = {}               # {session_key: {"id": str, "source": str, "title": str}}
+last_listed_conversations = {}        # {session_key: [{"id": str, "title": str, "source": str}]}
 bot_sent_ids = deque(maxlen=1000)     # Avoid bot reply feedback loops (FIFO)
 bot_sent_texts = deque(maxlen=500)    # Avoid bot reply loops by content match (FIFO)
 processed_msg_ids = deque(maxlen=1000)# Deduplicate incoming webhook deliveries (FIFO)
@@ -256,7 +261,7 @@ def get_target_chat_for_session(session_key):
         return target
 
 def load_sessions():
-    global active_sessions, user_models, chat_history, session_targets
+    global active_sessions, user_models, chat_history, session_targets, user_conversations
     if os.path.exists(SESSIONS_FILE):
         try:
             with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
@@ -267,6 +272,7 @@ def load_sessions():
                     user_models = data.get("models", {})
                     chat_history = data.get("history", {})
                     session_targets = data.get("targets", {})
+                    user_conversations = data.get("conversations", {})
                 else:
                     active_sessions = {k: float(v) for k, v in data.items()}
                 print(f"[Bridge] Loaded {len(active_sessions)} saved sessions.", flush=True)
@@ -280,7 +286,8 @@ def save_sessions():
                 "sessions": dict(active_sessions),
                 "models": dict(user_models),
                 "history": dict(chat_history),
-                "targets": dict(session_targets)
+                "targets": dict(session_targets),
+                "conversations": dict(user_conversations),
             }
         with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -365,6 +372,329 @@ def hermes_available():
     if hermes_backend is None:
         return False, "hermes backend module missing"
     return hermes_backend.available()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CONVERSATION MANAGEMENT (AGY, CLI, OTHER/IDE)
+# ══════════════════════════════════════════════════════════════════
+PORTABLE_GEMINI_CLI_DIR = os.path.join(PORTABLE_HOME, ".gemini", "antigravity-cli")
+HOST_USER_DIR = os.environ.get("USERPROFILE", r"C:\Users\T450")
+HOST_GEMINI_CLI_DIR = os.path.join(HOST_USER_DIR, ".gemini", "antigravity-cli")
+HOST_GEMINI_IDE_DIR = os.path.join(HOST_USER_DIR, ".gemini", "antigravity")
+
+CONVERSATION_SOURCES = {
+    "agy": {
+        "label": "AGY (Bridge)",
+        "db": os.path.join(PORTABLE_GEMINI_CLI_DIR, "conversation_summaries.db"),
+        "conversations_dir": os.path.join(PORTABLE_GEMINI_CLI_DIR, "conversations"),
+        "brain_dir": os.path.join(PORTABLE_GEMINI_CLI_DIR, "brain"),
+    },
+    "cli": {
+        "label": "Host CLI",
+        "db": os.path.join(HOST_GEMINI_CLI_DIR, "conversation_summaries.db"),
+        "conversations_dir": os.path.join(HOST_GEMINI_CLI_DIR, "conversations"),
+        "brain_dir": os.path.join(HOST_GEMINI_CLI_DIR, "brain"),
+    },
+    "other": {
+        "label": "Antigravity IDE / Desktop",
+        "db": os.path.join(HOST_GEMINI_IDE_DIR, "conversation_summaries.db"),
+        "conversations_dir": os.path.join(HOST_GEMINI_IDE_DIR, "conversations"),
+        "brain_dir": os.path.join(HOST_GEMINI_IDE_DIR, "brain"),
+    },
+}
+
+def format_conv_timestamp(ts_str):
+    if not ts_str:
+        return "Unknown date"
+    try:
+        clean_ts = ts_str.split("+")[0].split(".")[0].strip()
+        dt = datetime.datetime.fromisoformat(clean_ts)
+        now = datetime.datetime.now()
+        if dt.date() == now.date():
+            return "Today, " + dt.strftime("%I:%M %p")
+        elif dt.date() == (now.date() - datetime.timedelta(days=1)):
+            return "Yesterday, " + dt.strftime("%I:%M %p")
+        return dt.strftime("%b %d, %I:%M %p")
+    except Exception:
+        return str(ts_str)[:16]
+
+def fetch_conversations(source="agy", limit=6):
+    src_cfg = CONVERSATION_SOURCES.get(source)
+    if not src_cfg or not os.path.exists(src_cfg["db"]):
+        return []
+    db_path = src_cfg["db"]
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.cursor()
+        rows = cursor.execute('''
+            SELECT conversation_id, title, preview, last_modified_time, step_count
+            FROM conversation_summaries
+            ORDER BY last_modified_time DESC
+            LIMIT ?
+        ''', (limit,)).fetchall()
+        conn.close()
+        results = []
+        for r in rows:
+            cid, title, preview, mtime, steps = r
+            clean_title = (title or "").strip()
+            clean_prev = (preview or "").strip()
+            display_title = clean_title or (clean_prev[:40] + "..." if len(clean_prev) > 40 else clean_prev) or "Untitled Conversation"
+            results.append({
+                "id": cid,
+                "title": display_title,
+                "preview": clean_prev,
+                "modified": mtime,
+                "steps": steps or 0,
+                "source": source
+            })
+        return results
+    except Exception as e:
+        print(f"[Bridge] Error reading conversations from {source} ({db_path}): {e}", flush=True)
+        return []
+
+def ensure_conversation_available(conv_id, source="agy"):
+    """
+    Ensure the conversation .db and brain folder are available in the portable
+    AGY environment so agy.exe can resume it.
+    """
+    dest_convs = CONVERSATION_SOURCES["agy"]["conversations_dir"]
+    dest_brain = CONVERSATION_SOURCES["agy"]["brain_dir"]
+    os.makedirs(dest_convs, exist_ok=True)
+    os.makedirs(dest_brain, exist_ok=True)
+
+    dest_db_path = os.path.join(dest_convs, f"{conv_id}.db")
+
+    if not os.path.exists(dest_db_path):
+        candidate_dirs = [
+            CONVERSATION_SOURCES["other"]["conversations_dir"],
+            CONVERSATION_SOURCES["cli"]["conversations_dir"],
+        ]
+        for cdir in candidate_dirs:
+            src_db = os.path.join(cdir, f"{conv_id}.db")
+            if os.path.exists(src_db):
+                try:
+                    shutil.copyfile(src_db, dest_db_path)
+                    print(f"[Bridge] Copied conversation {conv_id}.db from {cdir} to portable AGY", flush=True)
+                    break
+                except Exception as e:
+                    print(f"[Bridge] Failed copying conversation {conv_id}.db: {e}", flush=True)
+
+    dest_brain_path = os.path.join(dest_brain, conv_id)
+    if not os.path.exists(dest_brain_path):
+        brain_candidates = [
+            os.path.join(CONVERSATION_SOURCES["other"]["brain_dir"], conv_id),
+            os.path.join(CONVERSATION_SOURCES["cli"]["brain_dir"], conv_id),
+        ]
+        for bsrc in brain_candidates:
+            if os.path.exists(bsrc):
+                try:
+                    shutil.copytree(bsrc, dest_brain_path)
+                    print(f"[Bridge] Copied brain folder for {conv_id} from {bsrc} to portable AGY", flush=True)
+                    break
+                except Exception as e:
+                    print(f"[Bridge] Failed copying brain folder {conv_id}: {e}", flush=True)
+
+def format_conversation_list_message(session_key, source="agy", limit=5):
+    cfg = CONVERSATION_SOURCES.get(source, CONVERSATION_SOURCES["agy"])
+    items = fetch_conversations(source=source, limit=limit)
+    with lock:
+        last_listed_conversations[session_key] = items
+        bound_conv = user_conversations.get(session_key)
+
+    active_header = ""
+    if bound_conv:
+        b_id = bound_conv.get("id", "")
+        b_title = bound_conv.get("title", "Untitled")
+        b_src = bound_conv.get("source", "agy").upper()
+        active_header = f"👉 *Active Bound Session:* {b_title}\n   (`{b_id}`) _[{b_src}]_\n\n"
+    else:
+        active_header = "👉 *Active Bound Session:* _(None - next prompt creates/continues default)_\n\n"
+
+    cmd_prefix = "conversation" if source == "agy" else f"conversation-{source}"
+
+    if not items:
+        return (
+            f"🗂️ *{cfg['label']} Conversations:*\n\n"
+            f"{active_header}"
+            f"_(No previous conversations found in this database)_\n\n"
+            f"Commands: `/conversation`, `/conversation-cli`, `/conversation-other`"
+        )
+
+    lines = [f"🗂️ *{cfg['label']} Conversations (Latest {len(items)}):*", "", active_header]
+    for idx, it in enumerate(items, 1):
+        m_time = format_conv_timestamp(it["modified"])
+        steps_str = f" • {it['steps']} steps" if it['steps'] else ""
+        is_cur = " 👈 *[BOUND]*" if (bound_conv and bound_conv.get("id") == it["id"]) else ""
+        lines.append(f"*{idx}.* *{it['title']}*{is_cur}")
+        lines.append(f"   • ID: `{it['id']}`")
+        lines.append(f"   • Modified: {m_time}{steps_str}")
+        if it["preview"] and it["preview"] != it["title"]:
+            short_prev = it["preview"].replace("\n", " ").strip()
+            if len(short_prev) > 60:
+                short_prev = short_prev[:60] + "..."
+            lines.append(f"   • Preview: _{short_prev}_")
+        lines.append("")
+
+    lines.append(f"👉 *Switch/Resume:* `/{cmd_prefix} <1-{len(items)}>` or `/{cmd_prefix} <id>`")
+    lines.append("👉 *Fresh Session:* `/conversation new`")
+    lines.append("👉 *Inspect Current:* `/conversation info`")
+    if source == "agy":
+        lines.append("👉 *Other Sources:* `/conversation-cli`, `/conversation-other`")
+    elif source == "cli":
+        lines.append("👉 *Other Sources:* `/conversation`, `/conversation-other`")
+    else:
+        lines.append("👉 *Other Sources:* `/conversation`, `/conversation-cli`")
+
+    return "\n".join(lines)
+
+def handle_conversation_command(target_chat, session_key, raw_text):
+    text_clean = raw_text.strip()
+    cmd_token = text_clean.split(maxsplit=1)[0].lower()
+    arg = text_clean.split(maxsplit=1)[1].strip() if " " in text_clean else ""
+
+    if cmd_token in ["/conversation-cli", "/conv-cli", "/conversations-cli"]:
+        source = "cli"
+    elif cmd_token in ["/conversation-other", "/conv-other", "/conversations-other", "/conversation-ide", "/conv-ide", "/conversations-ide"]:
+        source = "other"
+    else:
+        if arg.lower() == "cli" or arg.lower().startswith("cli "):
+            source = "cli"
+            arg = arg[3:].strip()
+        elif arg.lower() in ["other", "ide", "desktop"] or arg.lower().startswith(("other ", "ide ", "desktop ")):
+            source = "other"
+            tokens = arg.split(maxsplit=1)
+            arg = tokens[1].strip() if len(tokens) > 1 else ""
+        else:
+            source = "agy"
+
+    if arg.lower() in ["new", "clear", "reset"]:
+        interrupt_active_turn(session_key, reason="Conversation unbound by user")
+        with lock:
+            user_conversations.pop(session_key, None)
+            chat_history[session_key] = False
+            save_sessions()
+        send_whatsapp_message(
+            target_chat,
+            "🧹 *Conversation Unbound*\nStarted a fresh session context. Your next message will create a new AGY conversation."
+        )
+        return
+
+    if arg.lower() in ["info", "current", "status"]:
+        with lock:
+            bound_conv = user_conversations.get(session_key)
+            active_model = user_models.get(session_key, DEFAULT_MODEL)
+            has_hist = chat_history.get(session_key, False)
+        if not bound_conv:
+            send_whatsapp_message(
+                target_chat,
+                "ℹ️ *No Specific Conversation Bound*\n"
+                f"• Context Active: {'Yes (continuing previous)' if has_hist else 'No (fresh turn)'}\n"
+                f"• Active Model: `{active_model}`\n\n"
+                "Send `/conversation` to view recent conversations and select one."
+            )
+            return
+
+        cid = bound_conv.get("id")
+        c_src = bound_conv.get("source", "agy")
+        c_title = bound_conv.get("title", "Untitled")
+        cfg = CONVERSATION_SOURCES.get(c_src, CONVERSATION_SOURCES["agy"])
+        send_whatsapp_message(
+            target_chat,
+            f"ℹ️ *Active Conversation Details:*\n\n"
+            f"• *Title:* {c_title}\n"
+            f"• *ID:* `{cid}`\n"
+            f"• *Source:* {cfg['label']}\n"
+            f"• *Model:* `{active_model}`\n"
+            f"• *Context Status:* {'Active (continuing)' if has_hist else 'Fresh'}\n\n"
+            f"Send `/conversation new` to start fresh or `/conversation` to switch."
+        )
+        return
+
+    if not arg:
+        reply = format_conversation_list_message(session_key, source=source, limit=5)
+        send_whatsapp_message(target_chat, reply)
+        return
+
+    matched = None
+    with lock:
+        cached_items = last_listed_conversations.get(session_key, [])
+
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(cached_items):
+            matched = cached_items[idx]
+        else:
+            fresh_items = fetch_conversations(source=source, limit=max(idx + 1, 5))
+            if 0 <= idx < len(fresh_items):
+                matched = fresh_items[idx]
+
+    if not matched:
+        search_sources = [source] + [s for s in CONVERSATION_SOURCES if s != source]
+        for src_key in search_sources:
+            pool = fetch_conversations(source=src_key, limit=30)
+            for it in pool:
+                if it["id"].lower() == arg.lower():
+                    matched = it
+                    break
+            if matched:
+                break
+            for it in pool:
+                if it["id"].lower().startswith(arg.lower()):
+                    matched = it
+                    break
+            if matched:
+                break
+            if len(arg) >= 4:
+                for it in pool:
+                    if arg.lower() in it["title"].lower():
+                        matched = it
+                        break
+            if matched:
+                break
+
+    if not matched:
+        cmd_pfx = "conversation" if source == "agy" else f"conversation-{source}"
+        send_whatsapp_message(
+            target_chat,
+            f"⚠️ *Conversation not found:* `{arg}`\n"
+            f"Send `/{cmd_pfx}` to see the latest conversations with numbers."
+        )
+        return
+
+    conv_id = matched["id"]
+    conv_title = matched["title"]
+    match_source = matched.get("source", source)
+
+    ensure_conversation_available(conv_id, source=match_source)
+    interrupt_active_turn(session_key, reason="Conversation switched by user")
+
+    agent_name, _ = resolve_agent(session_key)
+    switched_agent_note = ""
+    if agent_name != "agy":
+        with lock:
+            agent_state["chats"].setdefault(session_key, {})["pinned"] = "agy"
+            save_agent_state()
+        switched_agent_note = "\n*(Also switched active agent to AGY)*"
+
+    with lock:
+        user_conversations[session_key] = {
+            "id": conv_id,
+            "source": match_source,
+            "title": conv_title
+        }
+        chat_history[session_key] = True
+        save_sessions()
+
+    src_label = CONVERSATION_SOURCES.get(match_source, {}).get("label", match_source.upper())
+    send_whatsapp_message(
+        target_chat,
+        f"🔄 *Switched to Conversation!*\n\n"
+        f"• *Title:* {conv_title}\n"
+        f"• *ID:* `{conv_id}`\n"
+        f"• *Source:* {src_label}{switched_agent_note}\n\n"
+        f"Your next prompt will continue directly inside this conversation context.\n"
+        f"Send `/conversation info` for details or `/clear` to start fresh."
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -711,9 +1041,17 @@ def stop_hermes(chat_key, generation):
 def _run_agy_turn(prompt, target_chat, session_key, model, continue_session, turn, typing_indicator):
     """Run one AGY turn (streaming or batch). Returns the reply text."""
     last_agy_stderr.clear()
+    with lock:
+        bound_conv = user_conversations.get(session_key)
+        conv_id = bound_conv.get("id") if bound_conv else None
+        source = bound_conv.get("source", "agy") if bound_conv else "agy"
+
+    if conv_id:
+        ensure_conversation_available(conv_id, source=source)
+
     if AGY_STREAMING_ENABLED:
-        return stream_agy_prompt(prompt, target_chat, model=model, continue_session=continue_session, turn=turn)
-    reply = run_agy_prompt(prompt, model=model, continue_session=continue_session, turn=turn)
+        return stream_agy_prompt(prompt, target_chat, model=model, continue_session=continue_session, turn=turn, conversation_id=conv_id, session_key=session_key)
+    reply = run_agy_prompt(prompt, model=model, continue_session=continue_session, turn=turn, conversation_id=conv_id)
     if not turn.is_interrupted.is_set():
         send_whatsapp_message(target_chat, f"🤖 AGY:\n{reply}")
     return reply
@@ -1081,7 +1419,7 @@ def sync_gemini_md():
     except Exception as e:
         print(f"[Bridge] Warning syncing GEMINI.md: {e}", flush=True)
 
-def run_agy_prompt(prompt, model=None, continue_session=False, turn=None):
+def run_agy_prompt(prompt, model=None, continue_session=False, turn=None, conversation_id=None):
     """Executes agy.exe directly using file-backed stdout/stderr to avoid Windows pipe inheritance hangs."""
     proc = None
     try:
@@ -1093,7 +1431,9 @@ def run_agy_prompt(prompt, model=None, continue_session=False, turn=None):
 
         if model:
             cmd.extend(["--model", model])
-        if continue_session:
+        if conversation_id:
+            cmd.extend(["--conversation", conversation_id])
+        elif continue_session:
             cmd.append("--continue")
         cmd.extend(["-p", prompt])
 
@@ -1174,7 +1514,7 @@ def _final_delta(final_norm, sent_norm):
     return final_norm
 
 
-def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, turn=None):
+def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, turn=None, conversation_id=None, session_key=None):
     """
     Executes agy.exe with --output-format stream-json, progressively
     parsing NDJSON events and dispatching separated responses to WhatsApp.
@@ -1188,7 +1528,9 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, t
 
     if model:
         cmd.extend(["--model", model])
-    if continue_session:
+    if conversation_id:
+        cmd.extend(["--conversation", conversation_id])
+    elif continue_session:
         cmd.append("--continue")
     cmd.extend(["-p", prompt])
 
@@ -1319,6 +1661,22 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, t
                 continue
 
             event = data.get("event")
+
+            if event == "init":
+                init_cid = data.get("conversation_id")
+                if init_cid and session_key:
+                    with lock:
+                        curr = user_conversations.get(session_key)
+                        if not curr:
+                            user_conversations[session_key] = {
+                                "id": init_cid,
+                                "source": "agy",
+                                "title": "Active Session"
+                            }
+                            save_sessions()
+                        elif curr.get("id") != init_cid:
+                            curr["id"] = init_cid
+                            save_sessions()
 
             # 1. Capture Agent Response Text Deltas
             if event == "step_update":
@@ -1604,6 +1962,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             interrupt_active_turn(session_key, reason="Cleared by user")
             with lock:
                 chat_history[session_key] = False
+                user_conversations.pop(session_key, None)
                 chat = agent_state["chats"].setdefault(session_key, {})
                 chat["generation"] = int(chat.get("generation", 1)) + 1
                 save_sessions()
@@ -1614,6 +1973,25 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 target_chat,
                 f"🧹 *Chat Context Cleared*\nStarted a fresh {label} session. Your next message will have a clean context."
             )
+            return
+
+        # Command: /conversation, /conversation-cli, /conversation-other (and aliases)
+        cmd_lower = body_clean.lower()
+        if (
+            cmd_lower in [
+                "/conversation", "/conversations", "/conv",
+                "/conversation-cli", "/conversations-cli", "/conv-cli",
+                "/conversation-other", "/conversations-other", "/conv-other",
+                "/conversation-ide", "/conversations-ide", "/conv-ide",
+            ]
+            or cmd_lower.startswith((
+                "/conversation ", "/conversations ", "/conv ",
+                "/conversation-cli ", "/conversations-cli ", "/conv-cli ",
+                "/conversation-other ", "/conversations-other ", "/conv-other ",
+                "/conversation-ide ", "/conversations-ide ", "/conv-ide ",
+            ))
+        ):
+            handle_conversation_command(target_chat, session_key, body_clean)
             return
 
         # Command: /switchagent (aliases: /agent, /harness)
@@ -1634,6 +2012,12 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 "• `/switchagent agy|hermes` - Select an agent\n"
                 "• `/switchagent status` - Show the current agent/health\n"
                 "• `/stop` - Detener inmediatamente la tarea activa\n"
+                "• `/conversation` - View & switch AGY conversations\n"
+                "• `/conversation <1-5|id>` - Resume a specific conversation\n"
+                "• `/conversation new` - Unbind & start fresh conversation\n"
+                "• `/conversation info` - Inspect active conversation details\n"
+                "• `/conversation-cli` - View & resume Host CLI conversations\n"
+                "• `/conversation-other` - View & resume Desktop/IDE conversations\n"
                 "• `/model` - View the active agent's models (AGY or DeepSeek)\n"
                 "• `/model <name>` - Switch LLM model (e.g. `/model deepseek-v4-pro`)\n"
                 "• `/model <name> <level>` - Switch model + thinking level (e.g. `/model deepseek-v4-pro high`)\n"
@@ -1779,6 +2163,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             with lock:
                 rem = max(0, int(INACTIVITY_TIMEOUT_SECONDS - (time.time() - active_sessions.get(session_key, time.time()))))
                 has_hist = chat_history.get(session_key, False)
+                bound_conv = user_conversations.get(session_key)
             agent_name, _mode = resolve_agent(session_key)
             if agent_name == "agy":
                 with lock:
@@ -1787,6 +2172,13 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             else:
                 active_model = get_hermes_model(session_key) or "deepseek-flash"
                 thinking_line = f"• *Thinking:* `{get_hermes_reasoning(session_key) or 'default'}`\n"
+            conv_line = ""
+            if bound_conv:
+                b_title = bound_conv.get("title", "Untitled")
+                b_id = bound_conv.get("id", "")
+                b_src = bound_conv.get("source", "agy").upper()
+                short_id = f"{b_id[:8]}...{b_id[-4:]}" if len(b_id) > 16 else b_id
+                conv_line = f"• *Conversation:* {b_title} (`{short_id}`) [{b_src}]\n"
             mins = rem // 60
             secs = rem % 60
             send_whatsapp_message(
@@ -1795,9 +2187,10 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 f"• *Agent:* {agent_name}\n"
                 f"• *Model:* `{active_model}`\n"
                 f"{thinking_line}"
+                f"{conv_line}"
                 f"• *Context Active:* {'Yes (continuing)' if has_hist else 'No (fresh turn)'}\n"
                 f"• *Auto-lock in:* {mins}m {secs}s\n\n"
-                f"Commands: `/switchagent`, `/model`, `/reasoning`, `/clear`, `/lock`, `/help`"
+                f"Commands: `/conversation`, `/switchagent`, `/model`, `/reasoning`, `/clear`, `/lock`, `/help`"
             )
             return
 
