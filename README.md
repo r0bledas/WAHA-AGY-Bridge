@@ -63,10 +63,22 @@ Two agent backends, one bridge:
 | `/clear` | Clear chat context and start a fresh session for the active agent |
 | `/status` | Session status, active agent/model, context state, auto-lock countdown |
 | `/stop` | Stop the running AGY or Hermes turn |
+| `/restart` | Hard reset & reboot bridge tunnel if unresponsive (alias: `///restart`) |
 | `/lock` | Immediately lock the session for the current chat |
 | `/help` | Show available commands |
 
 Aliases: `/agent`, `/harness` for `/switchagent`.
+
+---
+
+## Tool Execution Notifications & Self Surgery Mode
+
+- **Full Tool Command Visibility (Zero Truncation)**:
+  - Both AGY and Hermes report tool invocations directly to WhatsApp in full without `(X...)` ellipsis truncation.
+  - Commands, file paths, and parameter payloads are delivered completely so operators on WhatsApp can audit exact scripts and executions in real time.
+- **Self Surgery Mode**:
+  - When agents are tasked with maintaining, modifying, or repairing their own runtime (`agy_bridge.py`, `hermes_backend.py`, host daemons), they operate in **Self Surgery Mode**.
+  - Enforces mandatory pre-flight syntax compilation (`python -m py_compile`), process lifeline preservation, permanent session lock preservation, and delayed non-blocking daemon reboots (`/restart`).
 
 ---
 

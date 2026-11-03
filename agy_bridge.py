@@ -1140,7 +1140,7 @@ class HermesTextStreamer:
 
 
 def _hermes_tool_hint(tool_input):
-    """Best-effort one-line hint (command/path/query) for a Hermes tool call."""
+    """Full parameter hint (command/path/query/etc) for a Hermes tool call without truncation."""
     if not isinstance(tool_input, dict):
         return ""
     for key in (
@@ -1158,9 +1158,12 @@ def _hermes_tool_hint(tool_input):
         "prompt",
     ):
         if key in tool_input and tool_input[key]:
-            v = str(tool_input[key]).replace("\r", " ").replace("\n", " ").strip()
+            v = str(tool_input[key]).strip()
             if v:
-                return f" ({v[:60]}...)" if len(v) > 60 else f" ({v})"
+                return f" ({v})"
+    pairs = [f"{k}={v}" for k, v in tool_input.items() if v and not str(k).startswith("_")]
+    if pairs:
+        return f" ({', '.join(pairs)})"
     return ""
 
 
@@ -1892,17 +1895,23 @@ def stream_agy_prompt(prompt, target_chat, model=None, continue_session=False, t
                     params = tool_info.get("parameters", {}) or {}
 
                     def _tool_hint(src):
-                        for key in ("CommandLine", "TargetFile", "AbsolutePath", "file_path", "path", "query", "file"):
-                            if key in src:
-                                v = str(src[key]).strip().replace("\r", " ").replace("\n", " ")
+                        if not isinstance(src, dict):
+                            return ""
+                        for key in (
+                            "CommandLine", "command", "cmd", "TargetFile", "AbsolutePath",
+                            "file_path", "path", "query", "file", "url", "pattern", "description", "prompt"
+                        ):
+                            if key in src and src[key]:
+                                v = str(src[key]).strip()
                                 if v:
                                     return v
+                        pairs = [f"{k}={v}" for k, v in src.items() if v and not str(k).startswith("_")]
+                        if pairs:
+                            return ", ".join(pairs)
                         return ""
 
                     raw_hint = _tool_hint(params) or _tool_hint(tool_info)
-                    param_hint = ""
-                    if raw_hint:
-                        param_hint = f" ({raw_hint[:40]}...)" if len(raw_hint) > 40 else f" ({raw_hint})"
+                    param_hint = f" ({raw_hint})" if raw_hint else ""
 
                     if state == "ACTIVE":
                         send_tool_note(target_chat, f"Ejecutando: {tool_name}{param_hint}")
@@ -2081,7 +2090,7 @@ def get_help_message():
         "• `/clear` - Reset context and start a clean session\n"
         "• `/status` - Check timeout countdown & active model\n"
         "• `/lock` - Manually lock the session\n"
-        "• `///restart` - Hard reset & reboot bridge tunnel if unresponsive\n"
+        "• `/restart` (or `///restart`) - Hard reset & reboot bridge tunnel if unresponsive\n"
         "• `/help` - Show this commands list\n\n"
         "📎 *Documents & Images:*\n"
         "Attach any PDF, code, document, or image with your prompt to have the agent analyze it directly!"
@@ -2092,9 +2101,9 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
     now = time.time()
     body_clean = body.strip()
 
-    # Step 0: Remote Hard Restart Command ("///restart")
+    # Step 0: Remote Hard Restart Command ("///restart" or "/restart")
     # Allows recovering the tunnel remotely even if a task hangs or session expires
-    if body_clean.lower() == "///restart" or body_clean.lower().startswith("///restart "):
+    if body_clean.lower() in ("///restart", "/restart") or body_clean.lower().startswith(("/restart ", "///restart ")):
         passphrase_arg = body_clean.split(maxsplit=1)[1].strip() if " " in body_clean else ""
         is_self = (session_key == "self")
         with lock:
