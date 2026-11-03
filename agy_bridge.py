@@ -15,6 +15,12 @@ try:
 except Exception:
     hermes_backend = None
 
+# ── Local Extensions Hook (Optional private handlers; ignored by git) ──
+try:
+    import local_extensions
+except Exception:
+    local_extensions = None
+
 import re
 import sqlite3
 import datetime
@@ -247,6 +253,17 @@ def refresh_my_accounts():
                     MY_ACCOUNTS.add(me["lid"])
     except Exception as e:
         print(f"[Bridge] Error fetching my accounts: {e}", flush=True)
+
+def is_owner_account(session_key, target_chat=None):
+    """Returns True if the session_key or target_chat belongs to the bridge owner."""
+    if session_key == "self":
+        return True
+    with lock:
+        if session_key in MY_ACCOUNTS:
+            return True
+        if target_chat and target_chat in MY_ACCOUNTS:
+            return True
+    return False
 
 def canonical_chat_id(cid):
     if cid in MY_ACCOUNTS:
@@ -2113,6 +2130,20 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
         if is_self or is_authed or passphrase_arg == PASSPHRASE:
             handle_tunnel_restart(target_chat)
             return
+
+    # Step 0.2: Local Private Extensions Hook (Optional pre-auth custom handlers)
+    if local_extensions and hasattr(local_extensions, "handle_message"):
+        try:
+            if local_extensions.handle_message(
+                target_chat=target_chat,
+                session_key=session_key,
+                body_clean=body_clean,
+                send_msg_fn=send_whatsapp_message,
+                is_owner_fn=is_owner_account
+            ):
+                return
+        except Exception as e:
+            print(f"[Bridge] local_extensions execution notice: {e}", flush=True)
 
     # Step 1: Authentication & Inactivity Check
     with lock:

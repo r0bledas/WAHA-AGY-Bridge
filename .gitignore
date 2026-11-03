@@ -28,3 +28,8 @@ pip/
 agent_state.json
 agent_state.json.tmp
 workspace/
+
+# Local private extensions (never pushed)
+local_extensions.py
+local_*.py
+
