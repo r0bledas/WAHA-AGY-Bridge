@@ -299,12 +299,9 @@ def load_sessions():
         except Exception as e:
             print(f"[Bridge] Warning loading sessions: {e}", flush=True)
 
-    # Always ensure owner account ("self") is permanently authenticated unless explicitly /locked
     with lock:
-        if not session_locked.get("self", False):
-            active_sessions["self"] = time.time()
-            if "self" not in session_targets:
-                session_targets["self"] = next((acc for acc in MY_ACCOUNTS if acc.endswith("@c.us")), None) or "1234567890@c.us"
+        if "self" not in session_targets:
+            session_targets["self"] = next((acc for acc in MY_ACCOUNTS if acc.endswith("@c.us")), None) or "1234567890@c.us"
     save_sessions()
 
 def save_sessions():
@@ -1410,7 +1407,7 @@ def session_inactivity_watchdog():
     Owner account ('self') is permanently authenticated and never expires.
     """
     timeout_desc = f"{INACTIVITY_TIMEOUT_SECONDS}s" if INACTIVITY_TIMEOUT_SECONDS > 0 else "Disabled (Permanent)"
-    print(f"[Bridge] Session inactivity watchdog started (timeout: {timeout_desc}, self=permanent)", flush=True)
+    print(f"[Bridge] Session inactivity watchdog started (timeout: {timeout_desc})", flush=True)
     while True:
         try:
             time.sleep(10)
@@ -1420,10 +1417,6 @@ def session_inactivity_watchdog():
                 for s_key, last_active in list(active_sessions.items()):
                     if s_key in running_chats:
                         # Keep the session alive while an agent turn is running.
-                        active_sessions[s_key] = now
-                        continue
-                    if s_key == "self":
-                        # Owner account never expires automatically
                         active_sessions[s_key] = now
                         continue
                     if INACTIVITY_TIMEOUT_SECONDS > 0 and (now - last_active >= INACTIVITY_TIMEOUT_SECONDS):
@@ -2150,14 +2143,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
         last_active = active_sessions.get(session_key)
         is_authenticated = False
 
-        if session_key == "self":
-            # Owner account is permanently authenticated unless explicitly /locked
-            is_authenticated = not session_locked.get("self", False)
-            if is_authenticated:
-                active_sessions[session_key] = now
-                session_targets[session_key] = target_chat
-                save_sessions()
-        elif last_active is not None:
+        if last_active is not None and not session_locked.get(session_key, False):
             time_since = now - last_active
             if INACTIVITY_TIMEOUT_SECONDS <= 0 or time_since <= INACTIVITY_TIMEOUT_SECONDS:
                 is_authenticated = True
@@ -2166,7 +2152,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 save_sessions()
             else:
                 print(f"[Bridge] Session expired for {session_key} ({int(time_since)}s > {INACTIVITY_TIMEOUT_SECONDS}s)", flush=True)
-                del active_sessions[session_key]
+                active_sessions.pop(session_key, None)
                 save_sessions()
 
     # If session was detected as expired on this incoming message
@@ -2404,7 +2390,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
                 b_src = bound_conv.get("source", "agy").upper()
                 short_id = f"{b_id[:8]}...{b_id[-4:]}" if len(b_id) > 16 else b_id
                 conv_line = f"• *Conversation:* {b_title} (`{short_id}`) [{b_src}]\n"
-            if session_key == "self" or INACTIVITY_TIMEOUT_SECONDS <= 0:
+            if INACTIVITY_TIMEOUT_SECONDS <= 0:
                 lock_line = "• *Auto-lock:* Disabled (Permanent Session)\n"
             else:
                 mins = rem // 60
@@ -2572,17 +2558,11 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
         send_whatsapp_message(target_chat, welcome_msg)
         return
     else:
-        # If the sender is self / owner account: NEVER SILENTLY IGNORE!
-        if session_key == "self" or target_chat in MY_ACCOUNTS:
-            print(f"[Bridge] Owner account {session_key} is locked; prompting for passphrase", flush=True)
-            send_whatsapp_message(
-                target_chat,
-                "🔒 *Session Locked*\nSend your passphrase to unlock and resume chatting."
-            )
-            return
-
-        # STRICT STEALTH MODE: Only for unknown external third parties
-        print(f"[Bridge] Silently ignoring message from unauthenticated external contact {session_key} (stealth mode: no feedback)", flush=True)
+        # STRICT STEALTH MODE:
+        # When unauthenticated and the passphrase does not match, silently ignore the message.
+        # This applies to all contacts including owner/self, allowing personal files and notes
+        # to be sent in self-chat without triggering agent responses or lock prompts.
+        print(f"[Bridge] Silently ignoring unauthenticated message for {session_key} (stealth mode: no passphrase match)", flush=True)
         return
 
 def handle_webhook_payload(post_data):
