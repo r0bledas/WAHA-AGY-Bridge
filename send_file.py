@@ -49,7 +49,7 @@ def get_default_chat_id():
         acc = acc.strip()
         if acc:
             return acc
-    return "1234567890@c.us"
+    return ""
 
 def guess_mime(file_path):
     mime, _ = mimetypes.guess_type(file_path)

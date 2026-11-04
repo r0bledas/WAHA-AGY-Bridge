@@ -274,7 +274,7 @@ def get_target_chat_for_session(session_key):
     with lock:
         target = session_targets.get(session_key)
         if not target and session_key == "self":
-            target = next((acc for acc in MY_ACCOUNTS if acc.endswith("@c.us")), None) or "1234567890@c.us"
+            target = next((acc for acc in MY_ACCOUNTS if acc.endswith("@c.us")), None) or next(iter(MY_ACCOUNTS), None)
         elif not target:
             target = session_key
         return target
@@ -301,7 +301,7 @@ def load_sessions():
 
     with lock:
         if "self" not in session_targets:
-            session_targets["self"] = next((acc for acc in MY_ACCOUNTS if acc.endswith("@c.us")), None) or "1234567890@c.us"
+            session_targets["self"] = next((acc for acc in MY_ACCOUNTS if acc.endswith("@c.us")), None) or next(iter(MY_ACCOUNTS), None)
     save_sessions()
 
 def save_sessions():
