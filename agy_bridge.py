@@ -2546,14 +2546,7 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
             active_sessions[session_key] = now
             session_targets[session_key] = target_chat
             save_sessions()
-        welcome_msg = (
-            "🔓 *Access Granted!*\n\n"
-            "You are now connected to your machine's agents:\n"
-            "• *AGY* (Google Antigravity) - primary, `--dangerously-skip-permissions`\n"
-            "• *Hermes* (DeepSeek) - alternative, full terminal access\n\n"
-            "• Send any prompt, code, question, or attach documents & images.\n"
-            "• Commands: `/conversation`, `/switchagent`, `/model`, `/clear`, `/status`, `/lock`, `/help`"
-        )
+        welcome_msg = "🔓 *Access Granted!*"
         print(f"[Bridge] Authorized access for {session_key} ({sender_name})", flush=True)
         send_whatsapp_message(target_chat, welcome_msg)
         return
