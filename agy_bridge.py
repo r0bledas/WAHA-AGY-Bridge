@@ -2057,7 +2057,11 @@ def handle_tunnel_restart(target_chat):
         "    try { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } catch {}\n"
         "}\n"
         "Start-Sleep -Seconds 1\n"
-        "Start-Process -FilePath 'C:\\Program Files\\Python311\\python.exe' -ArgumentList '-u C:\\waha\\agy_bridge.py' -WorkingDirectory 'C:\\waha' -WindowStyle Hidden -RedirectStandardOutput 'C:\\waha\\bridge_stdout.log' -RedirectStandardError 'C:\\waha\\bridge_stderr.log'\n"
+        "try {\n"
+        "    schtasks /run /tn 'WAHA_Bridge'\n"
+        "} catch {\n"
+        "    Start-Process -FilePath 'C:\\Program Files\\Python311\\python.exe' -ArgumentList '-u C:\\waha\\agy_bridge.py' -WorkingDirectory 'C:\\waha' -WindowStyle Hidden -RedirectStandardOutput 'C:\\waha\\bridge_stdout.log' -RedirectStandardError 'C:\\waha\\bridge_stderr.log'\n"
+        "}\n"
     )
     try:
         with open(restart_script, "w", encoding="utf-8") as f:
@@ -2123,6 +2127,23 @@ def process_message(target_chat, body, sender_name, media_dict=None, media_paths
         if is_self or is_authed or passphrase_arg == PASSPHRASE:
             handle_tunnel_restart(target_chat)
             return
+
+    # Step 0.1: Master Passphrase Verification (Always takes absolute precedence over any sub-mode)
+    if body_clean == PASSPHRASE:
+        if local_extensions and hasattr(local_extensions, "reset_session"):
+            try:
+                local_extensions.reset_session(session_key)
+            except Exception:
+                pass
+        with lock:
+            session_locked.pop(session_key, None)
+            active_sessions[session_key] = now
+            session_targets[session_key] = target_chat
+            save_sessions()
+        welcome_msg = "🔓 *Access Granted!*\n\nYou are now connected to *Google Antigravity (AGY)* in `--dangerously-skip-permissions` mode.\n\n• Send any prompt, code, question, or attach documents & images.\n• Commands: `/model`, `/clear`, `/status`, `/lock`, `/help`\n• Session auto-locks after *10 minutes* of inactivity."
+        print(f"[Bridge] Master passphrase unlocked access for {session_key} ({sender_name})", flush=True)
+        send_whatsapp_message(target_chat, welcome_msg)
+        return
 
     # Step 0.2: Local Private Extensions Hook (Optional pre-auth custom handlers)
     if local_extensions and hasattr(local_extensions, "handle_message"):
