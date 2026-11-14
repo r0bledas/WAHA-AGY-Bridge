@@ -33,3 +33,16 @@ workspace/
 local_extensions.py
 local_*.py
 
+
+# Tokens, credentials & temp profiles
+token_cache.bin
+*.bin
+*.sqlite
+*_temp_profile/
+temp_*/
+tmp_*/
+downloaded_apps/
+*.apk
+*.zip
+*.tar.gz
+keys/
